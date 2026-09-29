@@ -1,9 +1,10 @@
 const SESSION_DAYS = 30;
 const MAX_MESSAGE = 4000;
 
-// Public user IDs are 8 digits.
-const PUBLIC_ID_MIN = 10000000;
-const PUBLIC_ID_MAX = 99999999;
+
+/* =========================================================
+   RESPONSE HELPERS
+========================================================= */
 
 function json(data, status = 200, extraHeaders = {}) {
   return new Response(JSON.stringify(data), {
@@ -15,6 +16,7 @@ function json(data, status = 200, extraHeaders = {}) {
   });
 }
 
+
 function html(body) {
   return new Response(body, {
     headers: {
@@ -23,26 +25,26 @@ function html(body) {
   });
 }
 
+
+/* =========================================================
+   SECURITY / RANDOM
+========================================================= */
+
 function randHex(bytes = 32) {
   const a = new Uint8Array(bytes);
+
   crypto.getRandomValues(a);
 
   return [...a]
-    .map(x => x.toString(16).padStart(2, "0"))
+    .map(x =>
+      x.toString(16).padStart(2, "0")
+    )
     .join("");
 }
 
-function randomPublicId() {
-  const a = new Uint32Array(1);
-  crypto.getRandomValues(a);
-
-  return (
-    PUBLIC_ID_MIN +
-    (a[0] % (PUBLIC_ID_MAX - PUBLIC_ID_MIN + 1))
-  );
-}
 
 function constantTimeEqual(a, b) {
+
   if (a.length !== b.length) {
     return false;
   }
@@ -50,11 +52,14 @@ function constantTimeEqual(a, b) {
   let diff = 0;
 
   for (let i = 0; i < a.length; i++) {
-    diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
+    diff |=
+      a.charCodeAt(i) ^
+      b.charCodeAt(i);
   }
 
   return diff === 0;
 }
+
 
 function b64(buf) {
   return btoa(
@@ -64,11 +69,19 @@ function b64(buf) {
   );
 }
 
+
+/* =========================================================
+   PASSWORD HASHING
+========================================================= */
+
 async function hashPassword(
   password,
   salt = randHex(16)
 ) {
-  const enc = new TextEncoder();
+
+  const enc =
+    new TextEncoder();
+
 
   const key =
     await crypto.subtle.importKey(
@@ -78,6 +91,7 @@ async function hashPassword(
       false,
       ["deriveBits"]
     );
+
 
   const bits =
     await crypto.subtle.deriveBits(
@@ -91,27 +105,38 @@ async function hashPassword(
       256
     );
 
+
   return `${salt}.${b64(bits)}`;
 }
+
 
 async function verifyPassword(
   password,
   stored
 ) {
-  const parts = stored.split(".");
+
+  const parts =
+    stored.split(".");
+
 
   if (parts.length !== 2) {
     return false;
   }
 
-  const salt = parts[0];
-  const expected = parts[1];
+
+  const salt =
+    parts[0];
+
+  const expected =
+    parts[1];
+
 
   const actual =
     await hashPassword(
       password,
       salt
     );
+
 
   return constantTimeEqual(
     actual,
@@ -120,15 +145,15 @@ async function verifyPassword(
 }
 
 
-/*
-==================================================
-DATABASE
-==================================================
-*/
+/* =========================================================
+   DATABASE INITIALIZATION
+========================================================= */
 
 async function initDB(db) {
 
   await db.batch([
+
+    /* USERS */
 
     db.prepare(`
       CREATE TABLE IF NOT EXISTS users (
@@ -140,6 +165,9 @@ async function initDB(db) {
       )
     `),
 
+
+    /* SESSIONS */
+
     db.prepare(`
       CREATE TABLE IF NOT EXISTS sessions (
         token TEXT PRIMARY KEY,
@@ -148,6 +176,9 @@ async function initDB(db) {
         expires_at INTEGER NOT NULL
       )
     `),
+
+
+    /* OLD ADMIN CHAT */
 
     db.prepare(`
       CREATE TABLE IF NOT EXISTS messages (
@@ -159,11 +190,28 @@ async function initDB(db) {
       )
     `),
 
+
+    /* DIRECT USER CHAT */
+
+    db.prepare(`
+      CREATE TABLE IF NOT EXISTS direct_messages (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        sender_id INTEGER NOT NULL,
+        recipient_id INTEGER NOT NULL,
+        body TEXT NOT NULL,
+        created_at INTEGER NOT NULL
+      )
+    `),
+
+
+    /* INDEXES */
+
     db.prepare(`
       CREATE INDEX IF NOT EXISTS
       idx_messages_user_id_id
       ON messages(user_id, id)
     `),
+
 
     db.prepare(`
       CREATE INDEX IF NOT EXISTS
@@ -171,169 +219,33 @@ async function initDB(db) {
       ON sessions(expires_at)
     `),
 
-    /*
-      User-to-user conversations.
-    */
-
-    db.prepare(`
-      CREATE TABLE IF NOT EXISTS conversations (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-
-        user_a INTEGER NOT NULL,
-        user_b INTEGER NOT NULL,
-
-        requested_by INTEGER NOT NULL,
-
-        status TEXT NOT NULL DEFAULT 'pending',
-
-        created_at INTEGER NOT NULL,
-        updated_at INTEGER NOT NULL,
-
-        UNIQUE(user_a, user_b)
-      )
-    `),
 
     db.prepare(`
       CREATE INDEX IF NOT EXISTS
-      idx_conversations_user_a
-      ON conversations(user_a)
+      idx_direct_messages_users
+      ON direct_messages(sender_id, recipient_id, id)
     `),
+
 
     db.prepare(`
       CREATE INDEX IF NOT EXISTS
-      idx_conversations_user_b
-      ON conversations(user_b)
-    `),
-
-    db.prepare(`
-      CREATE INDEX IF NOT EXISTS
-      idx_conversations_status
-      ON conversations(status)
-    `),
-
-    /*
-      Messages belonging to private user-to-user conversations.
-    */
-
-    db.prepare(`
-      CREATE TABLE IF NOT EXISTS conversation_messages (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-
-        conversation_id INTEGER NOT NULL,
-        sender_id INTEGER NOT NULL,
-
-        body TEXT NOT NULL,
-
-        created_at INTEGER NOT NULL
-      )
-    `),
-
-    db.prepare(`
-      CREATE INDEX IF NOT EXISTS
-      idx_conversation_messages_conversation
-      ON conversation_messages(conversation_id, id)
+      idx_direct_messages_recipient
+      ON direct_messages(recipient_id, id)
     `)
 
   ]);
-
-
-  /*
-    Add public_id to old installations.
-
-    If the column already exists, SQLite/D1 throws an error.
-    That error is intentionally ignored.
-  */
-
-  try {
-
-    await db.prepare(`
-      ALTER TABLE users
-      ADD COLUMN public_id INTEGER
-    `).run();
-
-  } catch (_) {
-    // Column already exists.
-  }
-
-
-  /*
-    Give existing users a public numeric ID.
-  */
-
-  const oldUsers =
-    await db.prepare(`
-      SELECT id
-      FROM users
-      WHERE public_id IS NULL
-    `).all();
-
-  for (
-    const user of oldUsers.results || []
-  ) {
-
-    let publicId = null;
-
-    for (let attempt = 0; attempt < 20; attempt++) {
-
-      const candidate =
-        randomPublicId();
-
-      const exists =
-        await db.prepare(`
-          SELECT id
-          FROM users
-          WHERE public_id = ?
-        `)
-          .bind(candidate)
-          .first();
-
-      if (!exists) {
-        publicId = candidate;
-        break;
-      }
-    }
-
-    if (publicId === null) {
-      throw new Error(
-        "Could not generate a unique public user ID."
-      );
-    }
-
-    await db.prepare(`
-      UPDATE users
-      SET public_id = ?
-      WHERE id = ?
-    `)
-      .bind(
-        publicId,
-        user.id
-      )
-      .run();
-  }
-
-
-  /*
-    Unique index for public IDs.
-  */
-
-  await db.prepare(`
-    CREATE UNIQUE INDEX IF NOT EXISTS
-    idx_users_public_id
-    ON users(public_id)
-  `).run();
 }
 
 
-/*
-==================================================
-COOKIES / SESSIONS
-==================================================
-*/
+/* =========================================================
+   COOKIE / SESSION
+========================================================= */
 
 function getCookie(req, name) {
 
   const cookie =
     req.headers.get("Cookie") || "";
+
 
   const match =
     cookie.match(
@@ -344,10 +256,12 @@ function getCookie(req, name) {
       )
     );
 
+
   return match
     ? match[1]
     : null;
 }
+
 
 function getSessionToken(req) {
   return getCookie(
@@ -355,6 +269,7 @@ function getSessionToken(req) {
     "session"
   );
 }
+
 
 async function getSession(
   req,
@@ -364,9 +279,11 @@ async function getSession(
   const token =
     getSessionToken(req);
 
+
   if (!token) {
     return null;
   }
+
 
   const row =
     await env.DB.prepare(`
@@ -381,9 +298,11 @@ async function getSession(
       .bind(token)
       .first();
 
+
   if (!row) {
     return null;
   }
+
 
   if (
     row.expires_at <
@@ -397,11 +316,14 @@ async function getSession(
       .bind(token)
       .run();
 
+
     return null;
   }
 
+
   return row;
 }
+
 
 function sessionCookie(token) {
 
@@ -415,6 +337,7 @@ function sessionCookie(token) {
   ].join("; ");
 }
 
+
 function deleteSessionCookie() {
 
   return [
@@ -427,6 +350,7 @@ function deleteSessionCookie() {
   ].join("; ");
 }
 
+
 async function requireUser(
   req,
   env
@@ -438,6 +362,7 @@ async function requireUser(
       env
     );
 
+
   if (
     !session ||
     session.role !== "user"
@@ -445,8 +370,10 @@ async function requireUser(
     return null;
   }
 
+
   return session;
 }
+
 
 async function requireAdmin(
   req,
@@ -459,6 +386,7 @@ async function requireAdmin(
       env
     );
 
+
   if (
     !session ||
     session.role !== "admin"
@@ -466,80 +394,14 @@ async function requireAdmin(
     return null;
   }
 
+
   return session;
 }
 
 
-/*
-==================================================
-CONVERSATION HELPERS
-==================================================
-*/
-
-function normalizePair(a, b) {
-
-  a = Number(a);
-  b = Number(b);
-
-  if (a < b) {
-    return [a, b];
-  }
-
-  return [b, a];
-}
-
-
-async function getConversationForUser(
-  db,
-  conversationId,
-  userId
-) {
-
-  return await db.prepare(`
-    SELECT *
-    FROM conversations
-    WHERE id = ?
-      AND (user_a = ? OR user_b = ?)
-  `)
-    .bind(
-      conversationId,
-      userId,
-      userId
-    )
-    .first();
-}
-
-
-async function getUserByPublicIdAndUsername(
-  db,
-  username,
-  publicId
-) {
-
-  return await db.prepare(`
-    SELECT
-      id,
-      username,
-      public_id,
-      role
-    FROM users
-    WHERE username = ?
-      AND public_id = ?
-      AND role = 'user'
-  `)
-    .bind(
-      username,
-      publicId
-    )
-    .first();
-}
-
-
-/*
-==================================================
-HTML
-==================================================
-*/
+/* =========================================================
+   FRONTEND
+========================================================= */
 
 const PAGE = `<!DOCTYPE html>
 
@@ -606,6 +468,17 @@ h3 {
   color: #9aa3ad;
 }
 
+.my-id {
+  margin-top: 6px;
+  font-size: 14px;
+  color: #aab3bd;
+}
+
+.my-id strong {
+  color: #ffffff;
+  font-size: 17px;
+}
+
 input,
 textarea,
 button {
@@ -623,7 +496,7 @@ input {
 }
 
 textarea {
-  min-height: 100px;
+  min-height: 110px;
   resize: vertical;
 }
 
@@ -658,31 +531,12 @@ button:hover {
   width: auto;
 }
 
-.profile-id {
-  margin-top: 5px;
-  color: #9aa3ad;
-}
-
-.profile-id strong {
-  color: white;
-  font-family: monospace;
-  letter-spacing: 1px;
-}
-
 .message {
   padding: 12px 15px;
   border-radius: 14px;
   margin: 8px 0;
   white-space: pre-wrap;
   word-break: break-word;
-}
-
-.message.mine {
-  background: #193522;
-}
-
-.message.theirs {
-  background: #202735;
 }
 
 .message.user {
@@ -693,15 +547,18 @@ button:hover {
   background: #202735;
 }
 
+.message.mine {
+  background: #193522;
+}
+
+.message.theirs {
+  background: #202735;
+}
+
 .timestamp {
   font-size: 12px;
   color: #89929d;
   margin-top: 5px;
-}
-
-.status {
-  min-height: 22px;
-  color: #aab3bd;
 }
 
 .user-button {
@@ -709,34 +566,19 @@ button:hover {
   margin: 5px 0;
 }
 
-.request {
-  border: 1px solid #303841;
-  border-radius: 14px;
-  padding: 12px;
-  margin: 8px 0;
+.status {
+  min-height: 22px;
+  color: #aab3bd;
 }
 
-.request-actions {
-  display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: 8px;
+.divider {
+  height: 1px;
+  background: #252b32;
+  margin: 18px 0;
 }
 
-.request-actions button {
-  margin-top: 8px;
-}
-
-.conversation-button {
-  text-align: left;
-}
-
-.small {
-  font-size: 13px;
-}
-
-.empty {
-  color: #7f8994;
-  padding: 10px 0;
+.chat-user-info {
+  margin-bottom: 12px;
 }
 
 @media (max-width: 650px) {
@@ -759,300 +601,338 @@ button:hover {
 
 </head>
 
+
 <body>
+
 
 <div class="container">
 
-<div class="card">
 
-<h1>Private Chat</h1>
+  <!-- HEADER -->
 
-<div class="muted">
-Talk directly with another user.
-</div>
+  <div class="card">
 
-</div>
+    <h1>Hello</h1>
 
+    <div class="muted">
+      Private Chat
+    </div>
 
-<!-- AUTH -->
+    <p>
+      Talk directly with other users.
+    </p>
 
-<div
-  id="auth"
-  class="card"
->
+  </div>
 
-<div class="row">
 
-<div>
+  <!-- =====================================================
+       AUTH
+  ====================================================== -->
 
-<h2>Register</h2>
+  <div
+    id="auth"
+    class="card"
+  >
 
-<input
-  id="registerUsername"
-  placeholder="Username"
-  autocomplete="username"
->
+    <div class="row">
 
-<input
-  id="registerPassword"
-  type="password"
-  placeholder="Password (8+ characters)"
-  autocomplete="new-password"
->
 
-<button onclick="registerUser()">
-Create account
-</button>
+      <!-- REGISTER -->
 
-</div>
+      <div>
 
+        <h2>Register</h2>
 
-<div>
+        <input
+          id="registerUsername"
+          placeholder="Username"
+          autocomplete="username"
+        >
 
-<h2>Login</h2>
+        <input
+          id="registerPassword"
+          type="password"
+          placeholder="Password (8+ characters)"
+          autocomplete="new-password"
+        >
 
-<input
-  id="loginUsername"
-  placeholder="Username"
-  autocomplete="username"
->
+        <button
+          onclick="registerUser()"
+        >
+          Create account
+        </button>
 
-<input
-  id="loginPassword"
-  type="password"
-  placeholder="Password"
-  autocomplete="current-password"
->
+      </div>
 
-<button onclick="loginUser()">
-Login
-</button>
 
-</div>
+      <!-- LOGIN -->
 
-</div>
+      <div>
 
-<p
-  id="authStatus"
-  class="status"
-></p>
+        <h2>Login</h2>
 
-</div>
+        <input
+          id="loginUsername"
+          placeholder="Username"
+          autocomplete="username"
+        >
 
+        <input
+          id="loginPassword"
+          type="password"
+          placeholder="Password"
+          autocomplete="current-password"
+        >
 
-<!-- USER -->
+        <button
+          onclick="loginUser()"
+        >
+          Login
+        </button>
 
-<div
-  id="userPanel"
-  class="hidden"
->
+      </div>
 
+    </div>
 
-<div class="card top">
 
-<div>
+    <p
+      id="authStatus"
+      class="status"
+    ></p>
 
-<div>
-Logged in as
-<strong id="currentUsername"></strong>
-</div>
+  </div>
 
-<div class="profile-id">
-Your ID:
-<strong id="currentPublicId"></strong>
-</div>
 
-</div>
+  <!-- =====================================================
+       USER PANEL
+  ====================================================== -->
 
-<button
-  onclick="logout()"
-  style="width:auto"
->
-Logout
-</button>
+  <div
+    id="userPanel"
+    class="hidden"
+  >
 
-</div>
 
+    <!-- USER HEADER -->
 
-<!-- FIND USER -->
+    <div class="card top">
 
-<div class="card">
+      <div>
 
-<h2>Start a conversation</h2>
+        <div>
+          Logged in as
+          <strong
+            id="currentUsername"
+          ></strong>
+        </div>
 
-<p class="muted">
-You must enter both the exact username
-and the numeric ID of the person.
-</p>
+        <div class="my-id">
 
-<input
-  id="targetUsername"
-  placeholder="Username"
->
+          Your numeric ID:
+          <strong
+            id="currentUserId"
+          ></strong>
 
-<input
-  id="targetPublicId"
-  inputmode="numeric"
-  placeholder="Numeric User ID"
->
+        </div>
 
-<button onclick="sendConversationRequest()">
-Send conversation request
-</button>
+      </div>
 
-<p
-  id="requestStatus"
-  class="status"
-></p>
 
-</div>
+      <button
+        onclick="logout()"
+        style="width:auto"
+      >
+        Logout
+      </button>
 
+    </div>
 
-<!-- REQUESTS -->
 
-<div class="card">
+    <!-- FIND USER -->
 
-<h3>
-Incoming requests
-</h3>
+    <div class="card">
 
-<div id="incomingRequests"></div>
+      <h2>
+        Start a conversation
+      </h2>
 
-</div>
+      <p class="muted">
+        Enter both the username and numeric ID
+        of the person you want to contact.
+      </p>
 
 
-<!-- CONVERSATIONS -->
+      <input
+        id="targetUsername"
+        placeholder="Username"
+        autocomplete="off"
+      >
 
-<div class="card">
 
-<h3>
-My conversations
-</h3>
+      <input
+        id="targetUserId"
+        type="number"
+        min="1"
+        placeholder="Numeric ID"
+        autocomplete="off"
+      >
 
-<div id="conversationList"></div>
 
-</div>
+      <button
+        onclick="findUser()"
+      >
+        Find user
+      </button>
 
 
-<!-- CHAT -->
+      <p
+        id="targetStatus"
+        class="status"
+      ></p>
 
-<div
-  id="userConversation"
-  class="card hidden"
->
+    </div>
 
-<h3 id="conversationTitle">
-Conversation
-</h3>
 
-<div id="conversationMessages"></div>
+    <!-- DIRECT CHAT -->
 
-<textarea
-  id="conversationMessage"
-  maxlength="4000"
-  placeholder="Write a message..."
-></textarea>
+    <div
+      id="directChat"
+      class="card hidden"
+    >
 
-<button onclick="sendConversationMessage()">
-Send
-</button>
+      <div class="chat-user-info">
 
-</div>
+        <h2
+          id="directChatTitle"
+        ></h2>
 
+        <div
+          class="muted"
+          id="directChatId"
+        ></div>
 
-<!-- OLD ADMIN CHAT -->
+      </div>
 
-<div class="card">
 
-<h3>
-Administrator
-</h3>
+      <div class="divider"></div>
 
-<div id="userMessages"></div>
 
-<textarea
-  id="userMessage"
-  maxlength="4000"
-  placeholder="Message the administrator..."
-></textarea>
+      <div
+        id="directMessages"
+      ></div>
 
-<button onclick="sendUserMessage()">
-Send to administrator
-</button>
 
-</div>
+      <textarea
+        id="directMessage"
+        maxlength="4000"
+        placeholder="Write a message..."
+      ></textarea>
 
 
-</div>
+      <button
+        onclick="sendDirectMessage()"
+      >
+        Send
+      </button>
 
+    </div>
 
-<!-- ADMIN -->
 
-<div
-  id="adminPanel"
-  class="hidden"
->
+  </div>
 
-<div class="card top">
 
-<strong>
-Administrator Panel
-</strong>
+  <!-- =====================================================
+       ADMIN PANEL
+  ====================================================== -->
 
-<button
-  onclick="logout()"
-  style="width:auto"
->
-Logout
-</button>
+  <div
+    id="adminPanel"
+    class="hidden"
+  >
 
-</div>
 
+    <div class="card top">
 
-<div class="card">
+      <strong>
+        Administrator Panel
+      </strong>
 
-<h3>
-Users
-</h3>
+      <button
+        onclick="logout()"
+        style="width:auto"
+      >
+        Logout
+      </button>
 
-<div id="userList"></div>
+    </div>
 
-</div>
 
+    <div class="card">
 
-<div
-  id="adminConversation"
-  class="card hidden"
->
+      <h3>
+        Users
+      </h3>
 
-<h3 id="selectedUserTitle"></h3>
+      <div
+        id="userList"
+      ></div>
 
-<div id="adminMessages"></div>
+    </div>
 
-<textarea
-  id="adminMessage"
-  maxlength="4000"
-  placeholder="Reply..."
-></textarea>
 
-<button onclick="sendAdminMessage()">
-Reply
-</button>
+    <div
+      id="adminConversation"
+      class="card hidden"
+    >
 
-</div>
+      <h3
+        id="selectedUserTitle"
+      ></h3>
 
-</div>
+      <div
+        id="adminMessages"
+      ></div>
+
+      <textarea
+        id="adminMessage"
+        maxlength="4000"
+        placeholder="Reply..."
+      ></textarea>
+
+      <button
+        onclick="sendAdminMessage()"
+      >
+        Reply
+      </button>
+
+    </div>
+
+
+  </div>
+
 
 </div>
 
 
 <script>
 
+
+/* =========================================================
+   GLOBAL STATE
+========================================================= */
+
 let selectedUserId = null;
+
 let selectedUsername = null;
 
-let selectedConversationId = null;
+let currentUserId = null;
 
+let currentUsername = null;
+
+
+/* =========================================================
+   API
+========================================================= */
 
 async function api(
   url,
@@ -1074,12 +954,17 @@ async function api(
       }
     );
 
+
   let data = {};
 
+
   try {
+
     data =
       await response.json();
+
   } catch (_) {}
+
 
   if (!response.ok) {
 
@@ -1090,25 +975,41 @@ async function api(
 
   }
 
+
   return data;
 }
 
+
+/* =========================================================
+   HTML ESCAPE
+========================================================= */
 
 function escapeHTML(value) {
 
   return String(value).replace(
     /[&<>"']/g,
+
     character => ({
+
       "&": "&amp;",
+
       "<": "&lt;",
+
       ">": "&gt;",
+
       '"': "&quot;",
+
       "'": "&#039;"
+
     })[character]
   );
 
 }
 
+
+/* =========================================================
+   AUTH STATUS
+========================================================= */
 
 function setAuthStatus(
   message
@@ -1124,6 +1025,10 @@ function setAuthStatus(
 }
 
 
+/* =========================================================
+   REGISTER
+========================================================= */
+
 async function registerUser() {
 
   const username =
@@ -1134,12 +1039,14 @@ async function registerUser() {
       .value
       .trim();
 
+
   const password =
     document
       .getElementById(
         "registerPassword"
       )
       .value;
+
 
   try {
 
@@ -1157,11 +1064,13 @@ async function registerUser() {
         }
       );
 
+
     setAuthStatus(
       "Account created. Your numeric ID is " +
-      result.public_id +
+      result.user_id +
       ". You can now log in."
     );
+
 
   } catch (error) {
 
@@ -1174,6 +1083,10 @@ async function registerUser() {
 }
 
 
+/* =========================================================
+   LOGIN
+========================================================= */
+
 async function loginUser() {
 
   const username =
@@ -1184,12 +1097,14 @@ async function loginUser() {
       .value
       .trim();
 
+
   const password =
     document
       .getElementById(
         "loginPassword"
       )
       .value;
+
 
   try {
 
@@ -1206,7 +1121,9 @@ async function loginUser() {
       }
     );
 
+
     await loadCurrentUser();
+
 
   } catch (error) {
 
@@ -1219,6 +1136,10 @@ async function loginUser() {
 }
 
 
+/* =========================================================
+   CURRENT USER
+========================================================= */
+
 async function loadCurrentUser() {
 
   const data =
@@ -1226,11 +1147,16 @@ async function loadCurrentUser() {
       "/api/me"
     );
 
+
   document
-    .getElementById("auth")
+    .getElementById(
+      "auth"
+    )
     .classList
     .add("hidden");
 
+
+  /* ADMIN */
 
   if (
     data.role === "admin"
@@ -1243,10 +1169,21 @@ async function loadCurrentUser() {
       .classList
       .remove("hidden");
 
+
     await loadUsers();
 
     return;
   }
+
+
+  /* NORMAL USER */
+
+  currentUserId =
+    data.user_id;
+
+
+  currentUsername =
+    data.username;
 
 
   document
@@ -1267,20 +1204,17 @@ async function loadCurrentUser() {
 
   document
     .getElementById(
-      "currentPublicId"
+      "currentUserId"
     )
     .textContent =
-      data.public_id;
-
-
-  await Promise.all([
-    loadUserMessages(),
-    loadIncomingRequests(),
-    loadConversations()
-  ]);
+      data.user_id;
 
 }
 
+
+/* =========================================================
+   LOGOUT
+========================================================= */
 
 async function logout() {
 
@@ -1302,13 +1236,11 @@ async function logout() {
 }
 
 
-/*
-==================================================
-USER -> USER REQUEST
-==================================================
-*/
+/* =========================================================
+   FIND USER
+========================================================= */
 
-async function sendConversationRequest() {
+async function findUser() {
 
   const username =
     document
@@ -1318,339 +1250,206 @@ async function sendConversationRequest() {
       .value
       .trim();
 
-  const publicId =
-    document
-      .getElementById(
-        "targetPublicId"
-      )
-      .value
-      .trim();
+
+  const userId =
+    Number(
+      document
+        .getElementById(
+          "targetUserId"
+        )
+        .value
+    );
 
 
   const status =
     document
       .getElementById(
-        "requestStatus"
+        "targetStatus"
       );
 
 
-  status.textContent =
-    "";
+  if (
+    !username ||
+    !Number.isInteger(userId) ||
+    userId <= 0
+  ) {
+
+    status.textContent =
+      "Enter a valid username and numeric ID.";
+
+    return;
+  }
 
 
   try {
 
-    const result =
+    const data =
       await api(
-        "/api/conversations/request",
+        "/api/users/find",
         {
           method: "POST",
 
           body:
             JSON.stringify({
               username,
-              public_id: publicId
+              user_id: userId
             })
         }
       );
 
 
+    selectedUserId =
+      data.user.id;
+
+
+    selectedUsername =
+      data.user.username;
+
+
     status.textContent =
-      result.message ||
-      "Conversation request sent.";
+      "User found.";
+
 
     document
       .getElementById(
-        "targetUsername"
+        "directChat"
       )
-      .value = "";
+      .classList
+      .remove("hidden");
+
 
     document
       .getElementById(
-        "targetPublicId"
+        "directChatTitle"
       )
-      .value = "";
+      .textContent =
+        "Chat with " +
+        data.user.username;
 
 
-    await loadConversations();
+    document
+      .getElementById(
+        "directChatId"
+      )
+      .textContent =
+        "User ID: " +
+        data.user.id;
+
+
+    await loadDirectMessages();
+
 
   } catch (error) {
 
     status.textContent =
       error.message;
 
+
+    document
+      .getElementById(
+        "directChat"
+      )
+      .classList
+      .add("hidden");
+
   }
 
 }
 
 
-/*
-==================================================
-INCOMING REQUESTS
-==================================================
-*/
+/* =========================================================
+   LOAD DIRECT MESSAGES
+========================================================= */
 
-async function loadIncomingRequests() {
+async function loadDirectMessages() {
 
-  const data =
-    await api(
-      "/api/conversations/requests"
-    );
-
-
-  const container =
-    document
-      .getElementById(
-        "incomingRequests"
-      );
-
-
-  if (
-    !data.requests.length
-  ) {
-
-    container.innerHTML =
-      '<div class="empty">No pending requests.</div>';
-
+  if (!selectedUserId) {
     return;
   }
 
 
-  container.innerHTML =
-    data.requests
-      .map(request => {
-
-        return \`
-          <div class="request">
-
-            <strong>
-              \${escapeHTML(request.username)}
-            </strong>
-
-            <div class="muted small">
-              ID:
-              \${escapeHTML(request.public_id)}
-            </div>
-
-            <div class="request-actions">
-
-              <button
-                onclick="respondToRequest(\${request.id}, 'accepted')"
-              >
-                Accept
-              </button>
-
-              <button
-                onclick="respondToRequest(\${request.id}, 'rejected')"
-              >
-                Reject
-              </button>
-
-            </div>
-
-          </div>
-        \`;
-
-      })
-      .join("");
-
-}
-
-
-async function respondToRequest(
-  conversationId,
-  status
-) {
-
-  try {
-
-    await api(
-      "/api/conversations/respond",
-      {
-        method: "POST",
-
-        body:
-          JSON.stringify({
-            conversation_id:
-              conversationId,
-
-            status
-          })
-      }
-    );
-
-
-    await loadIncomingRequests();
-    await loadConversations();
-
-  } catch (error) {
-
-    alert(
-      error.message
-    );
-
-  }
-
-}
-
-
-/*
-==================================================
-CONVERSATIONS
-==================================================
-*/
-
-async function loadConversations() {
-
   const data =
     await api(
-      "/api/conversations"
-    );
-
-
-  const container =
-    document
-      .getElementById(
-        "conversationList"
-      );
-
-
-  if (
-    !data.conversations.length
-  ) {
-
-    container.innerHTML =
-      '<div class="empty">No active conversations.</div>';
-
-    return;
-  }
-
-
-  container.innerHTML =
-    data.conversations
-      .map(conversation => {
-
-        return \`
-          <button
-            class="conversation-button"
-            onclick="openConversation(\${conversation.id})"
-          >
-
-            <strong>
-              \${escapeHTML(conversation.username)}
-            </strong>
-
-            <span class="muted">
-              —
-              ID:
-              \${escapeHTML(conversation.public_id)}
-            </span>
-
-          </button>
-        \`;
-
-      })
-      .join("");
-
-}
-
-
-async function openConversation(
-  conversationId
-) {
-
-  selectedConversationId =
-    conversationId;
-
-
-  const data =
-    await api(
-      "/api/conversations/" +
+      "/api/direct/messages?user_id=" +
       encodeURIComponent(
-        conversationId
+        selectedUserId
       )
     );
 
 
-  document
-    .getElementById(
-      "userConversation"
-    )
-    .classList
-    .remove("hidden");
-
-
-  document
-    .getElementById(
-      "conversationTitle"
-    )
-    .textContent =
-      "Conversation with " +
-      data.user.username +
-      " (" +
-      data.user.public_id +
-      ")";
-
-
-  renderConversationMessages(
-    data.messages
-  );
-
-}
-
-
-function renderConversationMessages(
-  messages
-) {
-
   const container =
     document
       .getElementById(
-        "conversationMessages"
+        "directMessages"
       );
 
 
   container.innerHTML =
-    messages
-      .map(message => {
+    data.messages
+      .map(
+        message => {
 
-        const mine =
-          message.mine;
+          const mine =
+            Number(
+              message.sender_id
+            ) ===
+            Number(
+              currentUserId
+            );
 
 
-        return \`
-          <div
-            class="message \${mine ? "mine" : "theirs"}"
-          >
+          return `
+            <div class="message ${
+              mine
+                ? "mine"
+                : "theirs"
+            }">
 
-            <div>
-              \${escapeHTML(message.body)}
+              <div>
+                <strong>
+                  ${
+                    mine
+                      ? "You"
+                      : escapeHTML(
+                          selectedUsername
+                        )
+                  }
+                </strong>
+              </div>
+
+              <div>
+                ${
+                  escapeHTML(
+                    message.body
+                  )
+                }
+              </div>
+
+              <div class="timestamp">
+                ${
+                  new Date(
+                    message.created_at
+                  ).toLocaleString()
+                }
+              </div>
+
             </div>
+          `;
 
-            <div class="timestamp">
-              \${new Date(
-                message.created_at
-              ).toLocaleString()}
-            </div>
-
-          </div>
-        \`;
-
-      })
+        }
+      )
       .join("");
-
-
-  container.scrollTop =
-    container.scrollHeight;
 
 }
 
 
-async function sendConversationMessage() {
+/* =========================================================
+   SEND DIRECT MESSAGE
+========================================================= */
 
-  if (
-    !selectedConversationId
-  ) {
+async function sendDirectMessage() {
+
+  if (!selectedUserId) {
     return;
   }
 
@@ -1658,7 +1457,7 @@ async function sendConversationMessage() {
   const input =
     document
       .getElementById(
-        "conversationMessage"
+        "directMessage"
       );
 
 
@@ -1674,14 +1473,17 @@ async function sendConversationMessage() {
   try {
 
     await api(
-      "/api/conversations/message",
+      "/api/direct/messages",
       {
         method: "POST",
 
         body:
           JSON.stringify({
-            conversation_id:
-              selectedConversationId,
+            username:
+              selectedUsername,
+
+            user_id:
+              selectedUserId,
 
             body
           })
@@ -1691,9 +1493,9 @@ async function sendConversationMessage() {
 
     input.value = "";
 
-    await openConversation(
-      selectedConversationId
-    );
+
+    await loadDirectMessages();
+
 
   } catch (error) {
 
@@ -1706,108 +1508,9 @@ async function sendConversationMessage() {
 }
 
 
-/*
-==================================================
-OLD ADMIN CHAT
-==================================================
-*/
-
-async function loadUserMessages() {
-
-  const data =
-    await api(
-      "/api/messages"
-    );
-
-
-  const container =
-    document
-      .getElementById(
-        "userMessages"
-      );
-
-
-  container.innerHTML =
-    data.messages
-      .map(message => {
-
-        return \`
-          <div
-            class="message \${message.sender_role}"
-          >
-
-            <div>
-              \${escapeHTML(message.body)}
-            </div>
-
-            <div class="timestamp">
-              \${new Date(
-                message.created_at
-              ).toLocaleString()}
-            </div>
-
-          </div>
-        \`;
-
-      })
-      .join("");
-
-}
-
-
-async function sendUserMessage() {
-
-  const input =
-    document
-      .getElementById(
-        "userMessage"
-      );
-
-
-  const body =
-    input.value.trim();
-
-
-  if (!body) {
-    return;
-  }
-
-
-  try {
-
-    await api(
-      "/api/messages",
-      {
-        method: "POST",
-
-        body:
-          JSON.stringify({
-            body
-          })
-      }
-    );
-
-
-    input.value = "";
-
-    await loadUserMessages();
-
-  } catch (error) {
-
-    alert(
-      error.message
-    );
-
-  }
-
-}
-
-
-/*
-==================================================
-ADMIN
-==================================================
-*/
+/* =========================================================
+   ADMIN - USERS
+========================================================= */
 
 async function loadUsers() {
 
@@ -1837,31 +1540,35 @@ async function loadUsers() {
 
   container.innerHTML =
     data.users
-      .map(user => {
+      .map(
+        user => {
 
-        return \`
-          <button
-            class="user-button"
-            onclick="selectUser(\${user.id})"
-          >
+          const safeName =
+            escapeHTML(
+              user.username
+            );
 
-            <strong>
-              \${escapeHTML(user.username)}
-            </strong>
 
-            <div class="muted small">
-              ID:
-              \${escapeHTML(user.public_id)}
-            </div>
+          return `
+            <button
+              class="user-button"
+              onclick="selectUser(${user.id})"
+            >
+              ${safeName}
+              — ID: ${user.id}
+            </button>
+          `;
 
-          </button>
-        \`;
-
-      })
+        }
+      )
       .join("");
 
 }
 
+
+/* =========================================================
+   ADMIN - SELECT USER
+========================================================= */
 
 async function selectUser(
   userId
@@ -1888,6 +1595,7 @@ async function selectUser(
   selectedUserId =
     user.id;
 
+
   selectedUsername =
     user.username;
 
@@ -1907,15 +1615,18 @@ async function selectUser(
     .textContent =
       "Conversation with " +
       user.username +
-      " (" +
-      user.public_id +
-      ")";
+      " — ID: " +
+      user.id;
 
 
   await loadAdminMessages();
 
 }
 
+
+/* =========================================================
+   ADMIN - LOAD MESSAGES
+========================================================= */
 
 async function loadAdminMessages() {
 
@@ -1942,31 +1653,43 @@ async function loadAdminMessages() {
 
   container.innerHTML =
     data.messages
-      .map(message => {
+      .map(
+        message => {
 
-        return \`
-          <div
-            class="message \${message.sender_role}"
-          >
+          return `
+            <div class="message ${
+              message.sender_role
+            }">
 
-            <div>
-              \${escapeHTML(message.body)}
+              <div>
+                ${
+                  escapeHTML(
+                    message.body
+                  )
+                }
+              </div>
+
+              <div class="timestamp">
+                ${
+                  new Date(
+                    message.created_at
+                  ).toLocaleString()
+                }
+              </div>
+
             </div>
+          `;
 
-            <div class="timestamp">
-              \${new Date(
-                message.created_at
-              ).toLocaleString()}
-            </div>
-
-          </div>
-        \`;
-
-      })
+        }
+      )
       .join("");
 
 }
 
+
+/* =========================================================
+   ADMIN - SEND MESSAGE
+========================================================= */
 
 async function sendAdminMessage() {
 
@@ -2011,7 +1734,9 @@ async function sendAdminMessage() {
 
     input.value = "";
 
+
     await loadAdminMessages();
+
 
   } catch (error) {
 
@@ -2024,11 +1749,9 @@ async function sendAdminMessage() {
 }
 
 
-/*
-==================================================
-INITIALIZE
-==================================================
-*/
+/* =========================================================
+   INITIALIZE
+========================================================= */
 
 async function initialize() {
 
@@ -2044,14 +1767,13 @@ async function initialize() {
 
 }
 
+
 initialize();
 
 
-/*
-==================================================
-AUTO REFRESH
-==================================================
-*/
+/* =========================================================
+   AUTO REFRESH
+========================================================= */
 
 setInterval(
   async () => {
@@ -2081,30 +1803,28 @@ setInterval(
           );
 
 
+      /* USER */
+
       if (
         adminPanel.classList.contains(
           "hidden"
         )
       ) {
 
-        await loadIncomingRequests();
-
-        await loadConversations();
-
-        await loadUserMessages();
-
-
         if (
-          selectedConversationId
+          selectedUserId
         ) {
 
-          await openConversation(
-            selectedConversationId
-          );
+          await loadDirectMessages();
 
         }
 
-      } else {
+      }
+
+
+      /* ADMIN */
+
+      else {
 
         await loadUsers();
 
@@ -2132,11 +1852,9 @@ setInterval(
 </html>`;
 
 
-/*
-==================================================
-WORKER
-==================================================
-*/
+/* =========================================================
+   WORKER
+========================================================= */
 
 export default {
 
@@ -2146,6 +1864,10 @@ export default {
   ) {
 
     try {
+
+      /* ===================================================
+         DATABASE CHECK
+      =================================================== */
 
       if (!env.DB) {
 
@@ -2170,15 +1892,14 @@ export default {
           request.url
         );
 
+
       const path =
         url.pathname;
 
 
-      /*
-      ==============================================
-      FRONTEND
-      ==============================================
-      */
+      /* ===================================================
+         FRONTEND
+      =================================================== */
 
       if (
         request.method === "GET" &&
@@ -2192,11 +1913,9 @@ export default {
       }
 
 
-      /*
-      ==============================================
-      REGISTER
-      ==============================================
-      */
+      /* ===================================================
+         REGISTER
+      =================================================== */
 
       if (
         request.method === "POST" &&
@@ -2268,100 +1987,53 @@ export default {
         }
 
 
-        let publicId = null;
-
-
-        for (
-          let attempt = 0;
-          attempt < 30;
-          attempt++
-        ) {
-
-          const candidate =
-            randomPublicId();
-
-
-          const exists =
-            await env.DB.prepare(`
-              SELECT id
-              FROM users
-              WHERE public_id = ?
-            `)
-              .bind(candidate)
-              .first();
-
-
-          if (!exists) {
-
-            publicId =
-              candidate;
-
-            break;
-
-          }
-
-        }
-
-
-        if (
-          publicId === null
-        ) {
-
-          return json(
-            {
-              error:
-                "Could not generate a unique user ID."
-            },
-            500
-          );
-
-        }
-
-
         const passwordHash =
           await hashPassword(
             password
           );
 
 
-        await env.DB.prepare(`
-          INSERT INTO users
-          (
-            username,
-            password_hash,
-            role,
-            created_at,
-            public_id
-          )
-          VALUES (?, ?, ?, ?, ?)
-        `)
-          .bind(
-            username,
-            passwordHash,
-            "user",
-            Date.now(),
-            publicId
-          )
-          .run();
+        /*
+         * SQLite / D1 automatically
+         * generates the numeric user ID.
+         */
+
+        const result =
+          await env.DB.prepare(`
+            INSERT INTO users
+            (
+              username,
+              password_hash,
+              role,
+              created_at
+            )
+            VALUES (?, ?, ?, ?)
+          `)
+            .bind(
+              username,
+              passwordHash,
+              "user",
+              Date.now()
+            )
+            .run();
 
 
-        return json(
-          {
-            ok: true,
-            username,
-            public_id:
-              publicId
-          }
-        );
+        const userId =
+          result.meta?.last_row_id;
+
+
+        return json({
+          ok: true,
+          user_id: userId,
+          username: username
+        });
 
       }
 
 
-      /*
-      ==============================================
-      LOGIN
-      ==============================================
-      */
+      /* ===================================================
+         LOGIN
+      =================================================== */
 
       if (
         request.method === "POST" &&
@@ -2375,9 +2047,9 @@ export default {
           await request.json();
 
 
-        /*
-        ADMIN
-        */
+        /* ===============================
+           ADMIN LOGIN
+        =============================== */
 
         if (
           username === "admin"
@@ -2385,7 +2057,7 @@ export default {
 
           if (
             typeof env.ADMIN_PASSWORD !==
-            "string" ||
+              "string" ||
             !env.ADMIN_PASSWORD
           ) {
 
@@ -2435,8 +2107,8 @@ export default {
               0,
               "admin",
               Date.now() +
-              SESSION_DAYS *
-              86400000
+                SESSION_DAYS *
+                86400000
             )
             .run();
 
@@ -2459,16 +2131,15 @@ export default {
         }
 
 
-        /*
-        NORMAL USER
-        */
+        /* ===============================
+           NORMAL USER LOGIN
+        =============================== */
 
         const user =
           await env.DB.prepare(`
             SELECT
               id,
               username,
-              public_id,
               password_hash,
               role
             FROM users
@@ -2532,8 +2203,8 @@ export default {
             user.id,
             "user",
             Date.now() +
-            SESSION_DAYS *
-            86400000
+              SESSION_DAYS *
+              86400000
           )
           .run();
 
@@ -2542,10 +2213,8 @@ export default {
           {
             ok: true,
             role: "user",
-            username:
-              user.username,
-            public_id:
-              user.public_id
+            user_id: user.id,
+            username: user.username
           },
           200,
           {
@@ -2559,11 +2228,9 @@ export default {
       }
 
 
-      /*
-      ==============================================
-      LOGOUT
-      ==============================================
-      */
+      /* ===================================================
+         LOGOUT
+      =================================================== */
 
       if (
         request.method === "POST" &&
@@ -2582,7 +2249,9 @@ export default {
             DELETE FROM sessions
             WHERE token = ?
           `)
-            .bind(token)
+            .bind(
+              token
+            )
             .run();
 
         }
@@ -2602,11 +2271,9 @@ export default {
       }
 
 
-      /*
-      ==============================================
-      CURRENT USER
-      ==============================================
-      */
+      /* ===================================================
+         CURRENT USER
+      =================================================== */
 
       if (
         request.method === "GET" &&
@@ -2624,8 +2291,7 @@ export default {
 
           return json(
             {
-              authenticated:
-                false
+              authenticated: false
             },
             401
           );
@@ -2633,29 +2299,28 @@ export default {
         }
 
 
+        /* ADMIN */
+
         if (
           session.role === "admin"
         ) {
 
           return json({
-            authenticated:
-              true,
-
-            role:
-              "admin",
-
-            username:
-              "admin"
+            authenticated: true,
+            role: "admin",
+            username: "admin"
           });
 
         }
 
 
+        /* NORMAL USER */
+
         const user =
           await env.DB.prepare(`
             SELECT
-              username,
-              public_id
+              id,
+              username
             FROM users
             WHERE id = ?
           `)
@@ -2665,30 +2330,32 @@ export default {
             .first();
 
 
+        if (!user) {
+
+          return json(
+            {
+              error:
+                "User not found."
+            },
+            404
+          );
+
+        }
+
+
         return json({
-          authenticated:
-            true,
-
-          role:
-            "user",
-
-          username:
-            user?.username ||
-            "user",
-
-          public_id:
-            user?.public_id ||
-            null
+          authenticated: true,
+          role: "user",
+          user_id: user.id,
+          username: user.username
         });
 
       }
 
 
-      /*
-      ==================================================
-      SEND USER -> ADMIN MESSAGE
-      ==================================================
-      */
+      /* ===================================================
+         OLD USER → ADMIN MESSAGES
+      =================================================== */
 
       if (
         request.method === "GET" &&
@@ -2734,8 +2401,7 @@ export default {
 
         return json({
           messages:
-            rows.results ||
-            []
+            rows.results || []
         });
 
       }
@@ -2817,16 +2483,13 @@ export default {
       }
 
 
-      /*
-      ==================================================
-      USER-TO-USER
-      SEND REQUEST
-      ==================================================
-      */
+      /* ===================================================
+         FIND USER FOR DIRECT CHAT
+      =================================================== */
 
       if (
         request.method === "POST" &&
-        path === "/api/conversations/request"
+        path === "/api/users/find"
       ) {
 
         const session =
@@ -2851,34 +2514,36 @@ export default {
 
         const {
           username,
-          public_id
+          user_id
         } =
           await request.json();
 
 
-        const targetUsername =
-          String(
-            username || ""
-          ).trim();
+        const usernameValue =
+          typeof username ===
+            "string"
+            ? username.trim()
+            : "";
 
 
-        const targetPublicId =
+        const userId =
           Number(
-            public_id
+            user_id
           );
 
 
         if (
-          !targetUsername ||
+          !usernameValue ||
           !Number.isInteger(
-            targetPublicId
-          )
+            userId
+          ) ||
+          userId <= 0
         ) {
 
           return json(
             {
               error:
-                "Both username and numeric user ID are required."
+                "Username and numeric ID are required."
             },
             400
           );
@@ -2886,36 +2551,15 @@ export default {
         }
 
 
-        const target =
-          await getUserByPublicIdAndUsername(
-            env.DB,
-            targetUsername,
-            targetPublicId
-          );
-
-
-        if (!target) {
-
-          return json(
-            {
-              error:
-                "Username and ID do not match any user."
-            },
-            404
-          );
-
-        }
-
-
         if (
-          target.id ===
+          userId ===
           session.user_id
         ) {
 
           return json(
             {
               error:
-                "You cannot start a conversation with yourself."
+                "You cannot start a chat with yourself."
             },
             400
           );
@@ -2923,285 +2567,30 @@ export default {
         }
 
 
-        const [
-          userA,
-          userB
-        ] =
-          normalizePair(
-            session.user_id,
-            target.id
-          );
-
-
-        const existing =
+        const user =
           await env.DB.prepare(`
-            SELECT *
-            FROM conversations
-            WHERE user_a = ?
-              AND user_b = ?
+            SELECT
+              id,
+              username
+            FROM users
+            WHERE
+              id = ?
+              AND username = ?
+              AND role = 'user'
           `)
             .bind(
-              userA,
-              userB
+              userId,
+              usernameValue
             )
             .first();
 
 
-        if (existing) {
-
-          if (
-            existing.status ===
-            "accepted"
-          ) {
-
-            return json(
-              {
-                error:
-                  "A conversation with this user already exists."
-              },
-              409
-            );
-
-          }
-
-
-          if (
-            existing.status ===
-            "pending"
-          ) {
-
-            return json(
-              {
-                error:
-                  "A conversation request is already pending."
-              },
-              409
-            );
-
-          }
-
-
-          /*
-            Allow a rejected conversation
-            to be requested again.
-          */
-
-          await env.DB.prepare(`
-            UPDATE conversations
-            SET
-              requested_by = ?,
-              status = 'pending',
-              updated_at = ?
-            WHERE id = ?
-          `)
-            .bind(
-              session.user_id,
-              Date.now(),
-              existing.id
-            )
-            .run();
-
-
-          return json({
-            ok: true,
-            message:
-              "Conversation request sent again."
-          });
-
-        }
-
-
-        await env.DB.prepare(`
-          INSERT INTO conversations
-          (
-            user_a,
-            user_b,
-            requested_by,
-            status,
-            created_at,
-            updated_at
-          )
-          VALUES (?, ?, ?, 'pending', ?, ?)
-        `)
-          .bind(
-            userA,
-            userB,
-            session.user_id,
-            Date.now(),
-            Date.now()
-          )
-          .run();
-
-
-        return json({
-          ok: true,
-          message:
-            "Conversation request sent."
-        });
-
-      }
-
-
-      /*
-      ==================================================
-      INCOMING REQUESTS
-      ==================================================
-      */
-
-      if (
-        request.method === "GET" &&
-        path === "/api/conversations/requests"
-      ) {
-
-        const session =
-          await requireUser(
-            request,
-            env
-          );
-
-
-        if (!session) {
+        if (!user) {
 
           return json(
             {
               error:
-                "Unauthorized"
-            },
-            401
-          );
-
-        }
-
-
-        const rows =
-          await env.DB.prepare(`
-            SELECT
-              c.id,
-              c.created_at,
-              u.username,
-              u.public_id
-            FROM conversations c
-            JOIN users u
-              ON u.id = c.requested_by
-            WHERE
-              c.status = 'pending'
-              AND c.requested_by != ?
-              AND
-              (
-                c.user_a = ?
-                OR
-                c.user_b = ?
-              )
-            ORDER BY c.created_at DESC
-          `)
-            .bind(
-              session.user_id,
-              session.user_id,
-              session.user_id
-            )
-            .all();
-
-
-        return json({
-          requests:
-            rows.results ||
-            []
-        });
-
-      }
-
-
-      /*
-      ==================================================
-      ACCEPT / REJECT REQUEST
-      ==================================================
-      */
-
-      if (
-        request.method === "POST" &&
-        path === "/api/conversations/respond"
-      ) {
-
-        const session =
-          await requireUser(
-            request,
-            env
-          );
-
-
-        if (!session) {
-
-          return json(
-            {
-              error:
-                "Unauthorized"
-            },
-            401
-          );
-
-        }
-
-
-        const {
-          conversation_id,
-          status
-        } =
-          await request.json();
-
-
-        const conversationId =
-          Number(
-            conversation_id
-          );
-
-
-        if (
-          !Number.isInteger(
-            conversationId
-          )
-        ) {
-
-          return json(
-            {
-              error:
-                "Invalid conversation ID."
-            },
-            400
-          );
-
-        }
-
-
-        if (
-          status !== "accepted" &&
-          status !== "rejected"
-        ) {
-
-          return json(
-            {
-              error:
-                "Invalid response."
-            },
-            400
-          );
-
-        }
-
-
-        const conversation =
-          await getConversationForUser(
-            env.DB,
-            conversationId,
-            session.user_id
-          );
-
-
-        if (!conversation) {
-
-          return json(
-            {
-              error:
-                "Conversation not found."
+                "No user found with this username and ID."
             },
             404
           );
@@ -3209,74 +2598,26 @@ export default {
         }
 
 
-        if (
-          conversation.status !==
-          "pending"
-        ) {
-
-          return json(
-            {
-              error:
-                "This request has already been handled."
-            },
-            409
-          );
-
-        }
-
-
-        /*
-          Only the recipient may accept/reject.
-        */
-
-        if (
-          conversation.requested_by ===
-          session.user_id
-        ) {
-
-          return json(
-            {
-              error:
-                "You cannot accept your own request."
-            },
-            403
-          );
-
-        }
-
-
-        await env.DB.prepare(`
-          UPDATE conversations
-          SET
-            status = ?,
-            updated_at = ?
-          WHERE id = ?
-        `)
-          .bind(
-            status,
-            Date.now(),
-            conversationId
-          )
-          .run();
-
-
         return json({
           ok: true,
-          status
+
+          user: {
+            id: user.id,
+            username:
+              user.username
+          }
         });
 
       }
 
 
-      /*
-      ==================================================
-      LIST ACCEPTED CONVERSATIONS
-      ==================================================
-      */
+      /* ===================================================
+         DIRECT CHAT - READ
+      =================================================== */
 
       if (
         request.method === "GET" &&
-        path === "/api/conversations"
+        path === "/api/direct/messages"
       ) {
 
         const session =
@@ -3294,154 +2635,46 @@ export default {
                 "Unauthorized"
             },
             401
-          );
-
-        }
-
-
-        const rows =
-          await env.DB.prepare(`
-            SELECT
-              c.id,
-              c.status,
-              c.updated_at,
-
-              u.username,
-              u.public_id
-
-            FROM conversations c
-
-            JOIN users u
-              ON u.id =
-                CASE
-                  WHEN c.user_a = ?
-                  THEN c.user_b
-                  ELSE c.user_a
-                END
-
-            WHERE
-              c.status = 'accepted'
-              AND
-              (
-                c.user_a = ?
-                OR
-                c.user_b = ?
-              )
-
-            ORDER BY
-              c.updated_at DESC
-          `)
-            .bind(
-              session.user_id,
-              session.user_id,
-              session.user_id
-            )
-            .all();
-
-
-        return json({
-          conversations:
-            rows.results ||
-            []
-        });
-
-      }
-
-
-      /*
-      ==================================================
-      OPEN CONVERSATION
-      ==================================================
-      */
-
-      const conversationMatch =
-        path.match(
-          /^\\/api\\/conversations\\/(\\d+)$/
-        );
-
-
-      if (
-        request.method === "GET" &&
-        conversationMatch
-      ) {
-
-        const session =
-          await requireUser(
-            request,
-            env
-          );
-
-
-        if (!session) {
-
-          return json(
-            {
-              error:
-                "Unauthorized"
-            },
-            401
-          );
-
-        }
-
-
-        const conversationId =
-          Number(
-            conversationMatch[1]
-          );
-
-
-        const conversation =
-          await getConversationForUser(
-            env.DB,
-            conversationId,
-            session.user_id
-          );
-
-
-        if (!conversation) {
-
-          return json(
-            {
-              error:
-                "Conversation not found."
-            },
-            404
-          );
-
-        }
-
-
-        if (
-          conversation.status !==
-          "accepted"
-        ) {
-
-          return json(
-            {
-              error:
-                "Conversation is not active."
-            },
-            403
           );
 
         }
 
 
         const otherUserId =
-          conversation.user_a ===
-          session.user_id
-            ? conversation.user_b
-            : conversation.user_a;
+          Number(
+            url.searchParams.get(
+              "user_id"
+            )
+          );
+
+
+        if (
+          !Number.isInteger(
+            otherUserId
+          ) ||
+          otherUserId <= 0
+        ) {
+
+          return json(
+            {
+              error:
+                "Valid user_id is required."
+            },
+            400
+          );
+
+        }
 
 
         const otherUser =
           await env.DB.prepare(`
             SELECT
-              username,
-              public_id
+              id,
+              username
             FROM users
-            WHERE id = ?
+            WHERE
+              id = ?
+              AND role = 'user'
           `)
             .bind(
               otherUserId
@@ -3449,74 +2682,76 @@ export default {
             .first();
 
 
-        const messages =
+        if (!otherUser) {
+
+          return json(
+            {
+              error:
+                "User not found."
+            },
+            404
+          );
+
+        }
+
+
+        const rows =
           await env.DB.prepare(`
             SELECT
               id,
               sender_id,
+              recipient_id,
               body,
               created_at
-            FROM conversation_messages
-            WHERE conversation_id = ?
+            FROM direct_messages
+
+            WHERE
+              (
+                sender_id = ?
+                AND recipient_id = ?
+              )
+
+              OR
+
+              (
+                sender_id = ?
+                AND recipient_id = ?
+              )
+
             ORDER BY id ASC
           `)
             .bind(
-              conversationId
+              session.user_id,
+              otherUserId,
+              otherUserId,
+              session.user_id
             )
             .all();
 
 
         return json({
-          conversation: {
-            id:
-              conversation.id,
-
-            status:
-              conversation.status
-          },
 
           user: {
+            id: otherUser.id,
             username:
-              otherUser?.username,
-
-            public_id:
-              otherUser?.public_id
+              otherUser.username
           },
 
           messages:
-            (
-              messages.results ||
-              []
-            ).map(
-              message => ({
-                id:
-                  message.id,
+            rows.results || []
 
-                body:
-                  message.body,
-
-                created_at:
-                  message.created_at,
-
-                mine:
-                  message.sender_id ===
-                  session.user_id
-              })
-            )
         });
 
       }
 
 
-      /*
-      ==================================================
-      SEND PRIVATE MESSAGE
-      ==================================================
-      */
+      /* ===================================================
+         DIRECT CHAT - SEND
+      =================================================== */
 
       if (
         request.method === "POST" &&
-        path === "/api/conversations/message"
+        path === "/api/direct/messages"
       ) {
 
         const session =
@@ -3540,28 +2775,54 @@ export default {
 
 
         const {
-          conversation_id,
+          username,
+          user_id,
           body
         } =
           await request.json();
 
 
-        const conversationId =
+        const usernameValue =
+          typeof username ===
+            "string"
+            ? username.trim()
+            : "";
+
+
+        const recipientId =
           Number(
-            conversation_id
+            user_id
           );
 
 
         if (
+          !usernameValue ||
           !Number.isInteger(
-            conversationId
-          )
+            recipientId
+          ) ||
+          recipientId <= 0
         ) {
 
           return json(
             {
               error:
-                "Invalid conversation ID."
+                "Username and numeric ID are required."
+            },
+            400
+          );
+
+        }
+
+
+        if (
+          recipientId ===
+          session.user_id
+        ) {
+
+          return json(
+            {
+              error:
+                "You cannot message yourself."
             },
             400
           );
@@ -3588,20 +2849,37 @@ export default {
         }
 
 
-        const conversation =
-          await getConversationForUser(
-            env.DB,
-            conversationId,
-            session.user_id
-          );
+        /*
+         * SECURITY:
+         *
+         * Both username AND numeric ID
+         * must belong to the same account.
+         */
+
+        const recipient =
+          await env.DB.prepare(`
+            SELECT
+              id,
+              username
+            FROM users
+            WHERE
+              id = ?
+              AND username = ?
+              AND role = 'user'
+          `)
+            .bind(
+              recipientId,
+              usernameValue
+            )
+            .first();
 
 
-        if (!conversation) {
+        if (!recipient) {
 
           return json(
             {
               error:
-                "Conversation not found."
+                "Username and ID do not match."
             },
             404
           );
@@ -3609,56 +2887,23 @@ export default {
         }
 
 
-        if (
-          conversation.status !==
-          "accepted"
-        ) {
-
-          return json(
-            {
-              error:
-                "Conversation is not active."
-            },
-            403
-          );
-
-        }
-
-
-        const now =
-          Date.now();
-
-
-        await env.DB.batch([
-
-          env.DB.prepare(`
-            INSERT INTO conversation_messages
-            (
-              conversation_id,
-              sender_id,
-              body,
-              created_at
-            )
-            VALUES (?, ?, ?, ?)
-          `)
-            .bind(
-              conversationId,
-              session.user_id,
-              body.trim(),
-              now
-            ),
-
-          env.DB.prepare(`
-            UPDATE conversations
-            SET updated_at = ?
-            WHERE id = ?
-          `)
-            .bind(
-              now,
-              conversationId
-            )
-
-        ]);
+        await env.DB.prepare(`
+          INSERT INTO direct_messages
+          (
+            sender_id,
+            recipient_id,
+            body,
+            created_at
+          )
+          VALUES (?, ?, ?, ?)
+        `)
+          .bind(
+            session.user_id,
+            recipient.id,
+            body.trim(),
+            Date.now()
+          )
+          .run();
 
 
         return json({
@@ -3668,11 +2913,9 @@ export default {
       }
 
 
-      /*
-      ==================================================
-      ADMIN USERS
-      ==================================================
-      */
+      /* ===================================================
+         ADMIN USERS
+      =================================================== */
 
       if (
         request.method === "GET" &&
@@ -3704,7 +2947,6 @@ export default {
             SELECT
               id,
               username,
-              public_id,
               created_at
             FROM users
             WHERE role = 'user'
@@ -3715,18 +2957,15 @@ export default {
 
         return json({
           users:
-            rows.results ||
-            []
+            rows.results || []
         });
 
       }
 
 
-      /*
-      ==================================================
-      ADMIN READ MESSAGES
-      ==================================================
-      */
+      /* ===================================================
+         ADMIN READ MESSAGES
+      =================================================== */
 
       if (
         request.method === "GET" &&
@@ -3798,18 +3037,15 @@ export default {
 
         return json({
           messages:
-            rows.results ||
-            []
+            rows.results || []
         });
 
       }
 
 
-      /*
-      ==================================================
-      ADMIN SEND MESSAGE
-      ==================================================
-      */
+      /* ===================================================
+         ADMIN SEND MESSAGE
+      =================================================== */
 
       if (
         request.method === "POST" &&
@@ -3888,9 +3124,11 @@ export default {
 
         const user =
           await env.DB.prepare(`
-            SELECT id
+            SELECT
+              id
             FROM users
-            WHERE id = ?
+            WHERE
+              id = ?
               AND role = 'user'
           `)
             .bind(
@@ -3938,11 +3176,9 @@ export default {
       }
 
 
-      /*
-      ==============================================
-      NOT FOUND
-      ==============================================
-      */
+      /* ===================================================
+         NOT FOUND
+      =================================================== */
 
       return new Response(
         "Not Found",
