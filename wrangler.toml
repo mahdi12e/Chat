@@ -1,0 +1,14 @@
+name = "private-chat"
+main = "worker.js"
+compatibility_date = "2026-09-29"
+workers_dev = true
+
+# D1 database binding. The Worker code uses env.DB.
+[[d1_databases]]
+binding = "DB"
+database_name = "private-chat-db"
+database_id = "REPLACE_WITH_YOUR_D1_DATABASE_ID"
+
+# ADMIN_PASSWORD is a secret and is NOT stored in this file.
+# CLI:        npx wrangler secret put ADMIN_PASSWORD
+# Dashboard:  Worker > Settings > Variables and Secrets > Add (type: Secret)
