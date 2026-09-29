@@ -1,947 +1,3975 @@
-// Private Chat: a two-way private messaging site on a single Cloudflare Worker + D1.
-// Bindings required: DB (D1 database). Secret required: ADMIN_PASSWORD.
+const SESSION_DAYS = 30;
+const MAX_MESSAGE = 4000;
 
-const SESSION_COOKIE = '__Host-sid';
-const SESSION_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
-const PBKDF2_ITERATIONS = 100000; // Cloudflare Workers allows at most 100000
-const MAX_MESSAGE_LENGTH = 4000;
-const MAX_JSON_BYTES = 16384;
-const USERNAME_RE = /^[A-Za-z0-9_]{3,30}$/;
+// Public user IDs are 8 digits.
+const PUBLIC_ID_MIN = 10000000;
+const PUBLIC_ID_MAX = 99999999;
 
-class HttpError extends Error {
-  constructor(status, message) {
-    super(message);
-    this.status = status;
-  }
+function json(data, status = 200, extraHeaders = {}) {
+  return new Response(JSON.stringify(data), {
+    status,
+    headers: {
+      "content-type": "application/json; charset=utf-8",
+      ...extraHeaders
+    }
+  });
 }
 
-const enc = new TextEncoder();
-
-const SCHEMA = [
-  'CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT NOT NULL UNIQUE COLLATE NOCASE, password_hash TEXT NOT NULL, role TEXT NOT NULL CHECK (role IN (\'user\', \'admin\')), created_at INTEGER NOT NULL)',
-  'CREATE TABLE IF NOT EXISTS sessions (token TEXT PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE, role TEXT NOT NULL, expires_at INTEGER NOT NULL)',
-  'CREATE TABLE IF NOT EXISTS messages (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE, sender_role TEXT NOT NULL CHECK (sender_role IN (\'user\', \'admin\')), body TEXT NOT NULL, created_at INTEGER NOT NULL)',
-  'CREATE INDEX IF NOT EXISTS idx_users_role ON users(role)',
-  'CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id)',
-  'CREATE INDEX IF NOT EXISTS idx_sessions_expires ON sessions(expires_at)',
-  'CREATE INDEX IF NOT EXISTS idx_messages_user_id ON messages(user_id, id)',
-  'CREATE INDEX IF NOT EXISTS idx_messages_created ON messages(created_at)'
-];
-
-let schemaReady = null;
-function ensureSchema(env) {
-  if (!schemaReady) {
-    schemaReady = env.DB.batch(SCHEMA.map((sql) => env.DB.prepare(sql))).catch((err) => {
-      schemaReady = null;
-      throw err;
-    });
-  }
-  return schemaReady;
+function html(body) {
+  return new Response(body, {
+    headers: {
+      "content-type": "text/html; charset=utf-8"
+    }
+  });
 }
 
-/* ---------- byte helpers ---------- */
+function randHex(bytes = 32) {
+  const a = new Uint8Array(bytes);
+  crypto.getRandomValues(a);
 
-function bytesToB64(bytes) {
-  let s = '';
-  for (let i = 0; i < bytes.length; i++) s += String.fromCharCode(bytes[i]);
-  return btoa(s);
+  return [...a]
+    .map(x => x.toString(16).padStart(2, "0"))
+    .join("");
 }
 
-function b64ToBytes(b64) {
-  const s = atob(b64);
-  const out = new Uint8Array(s.length);
-  for (let i = 0; i < s.length; i++) out[i] = s.charCodeAt(i);
-  return out;
-}
+function randomPublicId() {
+  const a = new Uint32Array(1);
+  crypto.getRandomValues(a);
 
-function bytesToHex(bytes) {
-  return Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('');
-}
-
-async function sha256Bytes(str) {
-  return new Uint8Array(await crypto.subtle.digest('SHA-256', enc.encode(str)));
+  return (
+    PUBLIC_ID_MIN +
+    (a[0] % (PUBLIC_ID_MAX - PUBLIC_ID_MIN + 1))
+  );
 }
 
 function constantTimeEqual(a, b) {
-  if (a.length !== b.length) return false;
+  if (a.length !== b.length) {
+    return false;
+  }
+
   let diff = 0;
-  for (let i = 0; i < a.length; i++) diff |= a[i] ^ b[i];
+
+  for (let i = 0; i < a.length; i++) {
+    diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  }
+
   return diff === 0;
 }
 
-/* ---------- password hashing (PBKDF2-SHA-256) ---------- */
-
-async function pbkdf2(password, salt, iterations) {
-  const key = await crypto.subtle.importKey('raw', enc.encode(password), 'PBKDF2', false, ['deriveBits']);
-  const bits = await crypto.subtle.deriveBits(
-    { name: 'PBKDF2', hash: 'SHA-256', salt: salt, iterations: iterations },
-    key,
-    256
+function b64(buf) {
+  return btoa(
+    String.fromCharCode(
+      ...new Uint8Array(buf)
+    )
   );
-  return new Uint8Array(bits);
 }
 
-async function hashPassword(password) {
-  const salt = crypto.getRandomValues(new Uint8Array(16));
-  const hash = await pbkdf2(password, salt, PBKDF2_ITERATIONS);
-  return 'pbkdf2_sha256$' + PBKDF2_ITERATIONS + '$' + bytesToB64(salt) + '$' + bytesToB64(hash);
+async function hashPassword(
+  password,
+  salt = randHex(16)
+) {
+  const enc = new TextEncoder();
+
+  const key =
+    await crypto.subtle.importKey(
+      "raw",
+      enc.encode(password),
+      "PBKDF2",
+      false,
+      ["deriveBits"]
+    );
+
+  const bits =
+    await crypto.subtle.deriveBits(
+      {
+        name: "PBKDF2",
+        salt: enc.encode(salt),
+        iterations: 100000,
+        hash: "SHA-256"
+      },
+      key,
+      256
+    );
+
+  return `${salt}.${b64(bits)}`;
 }
 
-async function verifyPassword(password, stored) {
-  if (typeof stored !== 'string') return false;
-  const parts = stored.split('$');
-  if (parts.length !== 4 || parts[0] !== 'pbkdf2_sha256') return false;
-  const iterations = parseInt(parts[1], 10);
-  if (!(iterations >= 1 && iterations <= 100000)) return false;
-  let salt, expected;
-  try {
-    salt = b64ToBytes(parts[2]);
-    expected = b64ToBytes(parts[3]);
-  } catch (e) {
+async function verifyPassword(
+  password,
+  stored
+) {
+  const parts = stored.split(".");
+
+  if (parts.length !== 2) {
     return false;
   }
-  const actual = await pbkdf2(password, salt, iterations);
-  return constantTimeEqual(actual, expected);
+
+  const salt = parts[0];
+  const expected = parts[1];
+
+  const actual =
+    await hashPassword(
+      password,
+      salt
+    );
+
+  return constantTimeEqual(
+    actual,
+    `${salt}.${expected}`
+  );
 }
 
-// Used so that login for a non-existent username takes about as long as a real one.
-let dummyHashPromise = null;
-function getDummyHash() {
-  if (!dummyHashPromise) dummyHashPromise = hashPassword('dummy-password-for-timing');
-  return dummyHashPromise;
-}
 
-/* ---------- HTTP helpers ---------- */
+/*
+==================================================
+DATABASE
+==================================================
+*/
 
-const BASE_HEADERS = {
-  'X-Content-Type-Options': 'nosniff',
-  'X-Frame-Options': 'DENY',
-  'Referrer-Policy': 'no-referrer',
-  'Cross-Origin-Opener-Policy': 'same-origin',
-  'Permissions-Policy': 'camera=(), microphone=(), geolocation=()',
-  'Strict-Transport-Security': 'max-age=31536000; includeSubDomains'
-};
+async function initDB(db) {
 
-function json(data, status, extraHeaders) {
-  return new Response(JSON.stringify(data), {
-    status: status || 200,
-    headers: Object.assign(
-      {},
-      BASE_HEADERS,
-      { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' },
-      extraHeaders || {}
-    )
-  });
-}
+  await db.batch([
 
-function getCookie(request, name) {
-  const header = request.headers.get('Cookie');
-  if (!header) return null;
-  const parts = header.split(';');
-  for (let i = 0; i < parts.length; i++) {
-    const p = parts[i];
-    const idx = p.indexOf('=');
-    if (idx < 0) continue;
-    if (p.slice(0, idx).trim() === name) return p.slice(idx + 1).trim();
-  }
-  return null;
-}
+    db.prepare(`
+      CREATE TABLE IF NOT EXISTS users (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        username TEXT NOT NULL UNIQUE,
+        password_hash TEXT NOT NULL,
+        role TEXT NOT NULL DEFAULT 'user',
+        created_at INTEGER NOT NULL
+      )
+    `),
 
-function sessionCookie(token) {
-  return SESSION_COOKIE + '=' + token + '; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=' + Math.floor(SESSION_TTL_MS / 1000);
-}
+    db.prepare(`
+      CREATE TABLE IF NOT EXISTS sessions (
+        token TEXT PRIMARY KEY,
+        user_id INTEGER NOT NULL,
+        role TEXT NOT NULL,
+        expires_at INTEGER NOT NULL
+      )
+    `),
 
-function clearCookie() {
-  return SESSION_COOKIE + '=; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=0';
-}
+    db.prepare(`
+      CREATE TABLE IF NOT EXISTS messages (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL,
+        sender_role TEXT NOT NULL,
+        body TEXT NOT NULL,
+        created_at INTEGER NOT NULL
+      )
+    `),
 
-function checkOrigin(request, url) {
-  const origin = request.headers.get('Origin');
-  if (origin && origin !== url.origin) throw new HttpError(403, 'Cross-origin request blocked.');
-  const site = request.headers.get('Sec-Fetch-Site');
-  if (site && site !== 'same-origin' && site !== 'none') throw new HttpError(403, 'Cross-site request blocked.');
-}
+    db.prepare(`
+      CREATE INDEX IF NOT EXISTS
+      idx_messages_user_id_id
+      ON messages(user_id, id)
+    `),
 
-async function readJson(request) {
-  const type = request.headers.get('Content-Type') || '';
-  if (type.indexOf('application/json') === -1) throw new HttpError(415, 'Content-Type must be application/json.');
-  const text = await request.text();
-  if (text.length > MAX_JSON_BYTES) throw new HttpError(413, 'Request body too large.');
-  let data;
-  try {
-    data = JSON.parse(text);
-  } catch (e) {
-    throw new HttpError(400, 'Invalid JSON.');
-  }
-  if (data === null || typeof data !== 'object' || Array.isArray(data)) throw new HttpError(400, 'Invalid JSON body.');
-  return data;
-}
+    db.prepare(`
+      CREATE INDEX IF NOT EXISTS
+      idx_sessions_expires
+      ON sessions(expires_at)
+    `),
 
-/* ---------- sessions ---------- */
+    /*
+      User-to-user conversations.
+    */
 
-async function createSession(env, userId, role) {
-  const token = bytesToHex(crypto.getRandomValues(new Uint8Array(32)));
-  const tokenHash = bytesToHex(await sha256Bytes(token));
-  const now = Date.now();
-  await env.DB.batch([
-    env.DB.prepare('DELETE FROM sessions WHERE expires_at <= ?1').bind(now),
-    env.DB.prepare('INSERT INTO sessions (token, user_id, role, expires_at) VALUES (?1, ?2, ?3, ?4)').bind(
-      tokenHash,
-      userId,
-      role,
-      now + SESSION_TTL_MS
-    )
+    db.prepare(`
+      CREATE TABLE IF NOT EXISTS conversations (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+
+        user_a INTEGER NOT NULL,
+        user_b INTEGER NOT NULL,
+
+        requested_by INTEGER NOT NULL,
+
+        status TEXT NOT NULL DEFAULT 'pending',
+
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+
+        UNIQUE(user_a, user_b)
+      )
+    `),
+
+    db.prepare(`
+      CREATE INDEX IF NOT EXISTS
+      idx_conversations_user_a
+      ON conversations(user_a)
+    `),
+
+    db.prepare(`
+      CREATE INDEX IF NOT EXISTS
+      idx_conversations_user_b
+      ON conversations(user_b)
+    `),
+
+    db.prepare(`
+      CREATE INDEX IF NOT EXISTS
+      idx_conversations_status
+      ON conversations(status)
+    `),
+
+    /*
+      Messages belonging to private user-to-user conversations.
+    */
+
+    db.prepare(`
+      CREATE TABLE IF NOT EXISTS conversation_messages (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+
+        conversation_id INTEGER NOT NULL,
+        sender_id INTEGER NOT NULL,
+
+        body TEXT NOT NULL,
+
+        created_at INTEGER NOT NULL
+      )
+    `),
+
+    db.prepare(`
+      CREATE INDEX IF NOT EXISTS
+      idx_conversation_messages_conversation
+      ON conversation_messages(conversation_id, id)
+    `)
+
   ]);
-  return token;
+
+
+  /*
+    Add public_id to old installations.
+
+    If the column already exists, SQLite/D1 throws an error.
+    That error is intentionally ignored.
+  */
+
+  try {
+
+    await db.prepare(`
+      ALTER TABLE users
+      ADD COLUMN public_id INTEGER
+    `).run();
+
+  } catch (_) {
+    // Column already exists.
+  }
+
+
+  /*
+    Give existing users a public numeric ID.
+  */
+
+  const oldUsers =
+    await db.prepare(`
+      SELECT id
+      FROM users
+      WHERE public_id IS NULL
+    `).all();
+
+  for (
+    const user of oldUsers.results || []
+  ) {
+
+    let publicId = null;
+
+    for (let attempt = 0; attempt < 20; attempt++) {
+
+      const candidate =
+        randomPublicId();
+
+      const exists =
+        await db.prepare(`
+          SELECT id
+          FROM users
+          WHERE public_id = ?
+        `)
+          .bind(candidate)
+          .first();
+
+      if (!exists) {
+        publicId = candidate;
+        break;
+      }
+    }
+
+    if (publicId === null) {
+      throw new Error(
+        "Could not generate a unique public user ID."
+      );
+    }
+
+    await db.prepare(`
+      UPDATE users
+      SET public_id = ?
+      WHERE id = ?
+    `)
+      .bind(
+        publicId,
+        user.id
+      )
+      .run();
+  }
+
+
+  /*
+    Unique index for public IDs.
+  */
+
+  await db.prepare(`
+    CREATE UNIQUE INDEX IF NOT EXISTS
+    idx_users_public_id
+    ON users(public_id)
+  `).run();
 }
 
-async function getSession(request, env) {
-  const token = getCookie(request, SESSION_COOKIE);
-  if (!token || !/^[a-f0-9]{64}$/.test(token)) return null;
-  const tokenHash = bytesToHex(await sha256Bytes(token));
-  const row = await env.DB.prepare(
-    'SELECT s.token AS token, s.expires_at AS expires_at, u.id AS user_id, u.username AS username, u.role AS role ' +
-      'FROM sessions s JOIN users u ON u.id = s.user_id WHERE s.token = ?1'
-  )
-    .bind(tokenHash)
-    .first();
-  if (!row) return null;
-  if (row.expires_at <= Date.now()) {
-    await env.DB.prepare('DELETE FROM sessions WHERE token = ?1').bind(tokenHash).run();
+
+/*
+==================================================
+COOKIES / SESSIONS
+==================================================
+*/
+
+function getCookie(req, name) {
+
+  const cookie =
+    req.headers.get("Cookie") || "";
+
+  const match =
+    cookie.match(
+      new RegExp(
+        "(?:^|;\\s*)" +
+        name +
+        "=([^;]+)"
+      )
+    );
+
+  return match
+    ? match[1]
+    : null;
+}
+
+function getSessionToken(req) {
+  return getCookie(
+    req,
+    "session"
+  );
+}
+
+async function getSession(
+  req,
+  env
+) {
+
+  const token =
+    getSessionToken(req);
+
+  if (!token) {
     return null;
   }
+
+  const row =
+    await env.DB.prepare(`
+      SELECT
+        token,
+        user_id,
+        role,
+        expires_at
+      FROM sessions
+      WHERE token = ?
+    `)
+      .bind(token)
+      .first();
+
+  if (!row) {
+    return null;
+  }
+
+  if (
+    row.expires_at <
+    Date.now()
+  ) {
+
+    await env.DB.prepare(`
+      DELETE FROM sessions
+      WHERE token = ?
+    `)
+      .bind(token)
+      .run();
+
+    return null;
+  }
+
   return row;
 }
 
-async function requireRole(request, env, role) {
-  const session = await getSession(request, env);
-  if (!session) throw new HttpError(401, 'Please log in.');
-  if (session.role !== role) throw new HttpError(403, 'Not allowed.');
+function sessionCookie(token) {
+
+  return [
+    `session=${token}`,
+    "Path=/",
+    "HttpOnly",
+    "Secure",
+    "SameSite=Strict",
+    `Max-Age=${SESSION_DAYS * 86400}`
+  ].join("; ");
+}
+
+function deleteSessionCookie() {
+
+  return [
+    "session=",
+    "Path=/",
+    "HttpOnly",
+    "Secure",
+    "SameSite=Strict",
+    "Max-Age=0"
+  ].join("; ");
+}
+
+async function requireUser(
+  req,
+  env
+) {
+
+  const session =
+    await getSession(
+      req,
+      env
+    );
+
+  if (
+    !session ||
+    session.role !== "user"
+  ) {
+    return null;
+  }
+
   return session;
 }
 
-/* ---------- validation ---------- */
+async function requireAdmin(
+  req,
+  env
+) {
 
-function cleanMessageBody(value) {
-  if (typeof value !== 'string') throw new HttpError(400, 'Message must be text.');
-  const body = value.trim();
-  if (body.length === 0) throw new HttpError(400, 'Message cannot be empty.');
-  if (body.length > MAX_MESSAGE_LENGTH) throw new HttpError(400, 'Message is longer than ' + MAX_MESSAGE_LENGTH + ' characters.');
-  return body;
-}
+  const session =
+    await getSession(
+      req,
+      env
+    );
 
-/* ---------- API handlers ---------- */
-
-async function handleRegister(request, env) {
-  const body = await readJson(request);
-  const username = typeof body.username === 'string' ? body.username.trim() : '';
-  const password = typeof body.password === 'string' ? body.password : '';
-  if (!USERNAME_RE.test(username)) {
-    throw new HttpError(400, 'Username must be 3-30 characters: letters, numbers and underscore only.');
-  }
-  if (password.length < 8) throw new HttpError(400, 'Password must be at least 8 characters.');
-  if (password.length > 128) throw new HttpError(400, 'Password must be at most 128 characters.');
-  if (username.toLowerCase() === 'admin') throw new HttpError(409, 'That username is not available.');
-
-  const passwordHash = await hashPassword(password);
-  let result;
-  try {
-    result = await env.DB.prepare("INSERT INTO users (username, password_hash, role, created_at) VALUES (?1, ?2, 'user', ?3)")
-      .bind(username, passwordHash, Date.now())
-      .run();
-  } catch (err) {
-    if (String(err && err.message).indexOf('UNIQUE') !== -1) throw new HttpError(409, 'That username is not available.');
-    throw err;
-  }
-  const userId = result.meta.last_row_id;
-  const token = await createSession(env, userId, 'user');
-  return json({ user: { username: username, role: 'user' } }, 201, { 'Set-Cookie': sessionCookie(token) });
-}
-
-async function handleLogin(request, env) {
-  const body = await readJson(request);
-  const username = typeof body.username === 'string' ? body.username.trim() : '';
-  const password = typeof body.password === 'string' ? body.password : '';
-  if (!username || !password || username.length > 30 || password.length > 256) {
-    throw new HttpError(400, 'Enter your username and password.');
+  if (
+    !session ||
+    session.role !== "admin"
+  ) {
+    return null;
   }
 
-  let userId;
-  let role;
-  let shownName;
+  return session;
+}
 
-  if (username.toLowerCase() === 'admin') {
-    const adminPassword = env.ADMIN_PASSWORD;
-    if (typeof adminPassword !== 'string' || adminPassword.length === 0) {
-      throw new HttpError(500, 'The ADMIN_PASSWORD secret is not configured on this Worker.');
-    }
-    const ok = constantTimeEqual(await sha256Bytes(password), await sha256Bytes(adminPassword));
-    if (!ok) throw new HttpError(401, 'Wrong username or password.');
-    // The admin row only exists so sessions have a user_id. Its hash is not a valid
-    // PBKDF2 hash, so it can never be used to log in through the normal user path.
-    await env.DB.prepare("INSERT OR IGNORE INTO users (username, password_hash, role, created_at) VALUES ('admin', '!', 'admin', ?1)")
-      .bind(Date.now())
-      .run();
-    const row = await env.DB.prepare("SELECT id FROM users WHERE username = 'admin' AND role = 'admin'").first();
-    if (!row) throw new HttpError(500, 'Could not initialise the administrator account.');
-    userId = row.id;
-    role = 'admin';
-    shownName = 'admin';
-  } else {
-    const row = await env.DB.prepare("SELECT id, username, password_hash FROM users WHERE username = ?1 AND role = 'user'")
-      .bind(username)
-      .first();
-    const stored = row ? row.password_hash : await getDummyHash();
-    const ok = await verifyPassword(password, stored);
-    if (!row || !ok) throw new HttpError(401, 'Wrong username or password.');
-    userId = row.id;
-    role = 'user';
-    shownName = row.username;
+
+/*
+==================================================
+CONVERSATION HELPERS
+==================================================
+*/
+
+function normalizePair(a, b) {
+
+  a = Number(a);
+  b = Number(b);
+
+  if (a < b) {
+    return [a, b];
   }
 
-  const token = await createSession(env, userId, role);
-  return json({ user: { username: shownName, role: role } }, 200, { 'Set-Cookie': sessionCookie(token) });
+  return [b, a];
 }
 
-async function handleLogout(request, env) {
-  const token = getCookie(request, SESSION_COOKIE);
-  if (token && /^[a-f0-9]{64}$/.test(token)) {
-    const tokenHash = bytesToHex(await sha256Bytes(token));
-    await env.DB.prepare('DELETE FROM sessions WHERE token = ?1').bind(tokenHash).run();
-  }
-  return json({ ok: true }, 200, { 'Set-Cookie': clearCookie() });
-}
 
-async function handleMe(request, env) {
-  const session = await getSession(request, env);
-  if (!session) throw new HttpError(401, 'Please log in.');
-  return json({ user: { username: session.username, role: session.role } });
-}
+async function getConversationForUser(
+  db,
+  conversationId,
+  userId
+) {
 
-function parseAfter(url) {
-  const n = Number(url.searchParams.get('after'));
-  return Number.isSafeInteger(n) && n > 0 ? n : 0;
-}
-
-async function fetchMessages(env, userId, after) {
-  const res = await env.DB.prepare(
-    'SELECT id, user_id, sender_role, body, created_at FROM (' +
-      'SELECT id, user_id, sender_role, body, created_at FROM messages WHERE user_id = ?1 AND id > ?2 ORDER BY id DESC LIMIT 500' +
-      ') ORDER BY id ASC'
-  )
-    .bind(userId, after)
-    .all();
-  return res.results || [];
-}
-
-async function insertMessage(env, userId, senderRole, body) {
-  const now = Date.now();
-  const result = await env.DB.prepare('INSERT INTO messages (user_id, sender_role, body, created_at) VALUES (?1, ?2, ?3, ?4)')
-    .bind(userId, senderRole, body, now)
-    .run();
-  return { id: result.meta.last_row_id, user_id: userId, sender_role: senderRole, body: body, created_at: now };
-}
-
-async function handleGetMessages(request, env, url) {
-  const session = await requireRole(request, env, 'user');
-  // The user id always comes from the session, never from the request.
-  const messages = await fetchMessages(env, session.user_id, parseAfter(url));
-  return json({ messages: messages });
-}
-
-async function handlePostMessage(request, env) {
-  const session = await requireRole(request, env, 'user');
-  const data = await readJson(request);
-  const body = cleanMessageBody(data.body);
-
-  const recent = await env.DB.prepare("SELECT COUNT(*) AS n FROM messages WHERE user_id = ?1 AND sender_role = 'user' AND created_at > ?2")
-    .bind(session.user_id, Date.now() - 60000)
+  return await db.prepare(`
+    SELECT *
+    FROM conversations
+    WHERE id = ?
+      AND (user_a = ? OR user_b = ?)
+  `)
+    .bind(
+      conversationId,
+      userId,
+      userId
+    )
     .first();
-  if (recent && recent.n >= 20) throw new HttpError(429, 'You are sending messages too fast. Wait a moment.');
-
-  const message = await insertMessage(env, session.user_id, 'user', body);
-  return json({ message: message }, 201);
 }
 
-async function handleAdminUsers(request, env) {
-  await requireRole(request, env, 'admin');
-  const res = await env.DB.prepare(
-    'SELECT u.id AS id, u.username AS username, u.created_at AS created_at, ' +
-      '(SELECT COUNT(*) FROM messages m WHERE m.user_id = u.id) AS message_count, ' +
-      '(SELECT MAX(m.created_at) FROM messages m WHERE m.user_id = u.id) AS last_message_at, ' +
-      '(SELECT m.sender_role FROM messages m WHERE m.user_id = u.id ORDER BY m.id DESC LIMIT 1) AS last_sender ' +
-      "FROM users u WHERE u.role = 'user' " +
-      'ORDER BY COALESCE((SELECT MAX(m.created_at) FROM messages m WHERE m.user_id = u.id), u.created_at) DESC LIMIT 1000'
-  ).all();
-  return json({ users: res.results || [] });
+
+async function getUserByPublicIdAndUsername(
+  db,
+  username,
+  publicId
+) {
+
+  return await db.prepare(`
+    SELECT
+      id,
+      username,
+      public_id,
+      role
+    FROM users
+    WHERE username = ?
+      AND public_id = ?
+      AND role = 'user'
+  `)
+    .bind(
+      username,
+      publicId
+    )
+    .first();
 }
 
-async function findChatUser(env, userId) {
-  return env.DB.prepare("SELECT id, username FROM users WHERE id = ?1 AND role = 'user'").bind(userId).first();
-}
 
-async function handleAdminGetMessages(request, env, url) {
-  await requireRole(request, env, 'admin');
-  const userId = Number(url.searchParams.get('user_id'));
-  if (!Number.isSafeInteger(userId) || userId <= 0) throw new HttpError(400, 'A valid user_id is required.');
-  const user = await findChatUser(env, userId);
-  if (!user) throw new HttpError(404, 'User not found.');
-  const messages = await fetchMessages(env, userId, parseAfter(url));
-  return json({ user: { id: user.id, username: user.username }, messages: messages });
-}
+/*
+==================================================
+HTML
+==================================================
+*/
 
-async function handleAdminPostMessage(request, env) {
-  await requireRole(request, env, 'admin');
-  const data = await readJson(request);
-  const userId = data.user_id;
-  if (!Number.isSafeInteger(userId) || userId <= 0) throw new HttpError(400, 'A valid user_id is required.');
-  const body = cleanMessageBody(data.body);
-  const user = await findChatUser(env, userId);
-  if (!user) throw new HttpError(404, 'User not found.');
-  const message = await insertMessage(env, userId, 'admin', body);
-  return json({ message: message }, 201);
-}
+const PAGE = `<!DOCTYPE html>
 
-/* ---------- routing ---------- */
-
-async function route(request, env) {
-  const url = new URL(request.url);
-  const method = request.method;
-  const path = url.pathname;
-
-  if (path === '/' || path === '/index.html') {
-    if (method !== 'GET' && method !== 'HEAD') throw new HttpError(405, 'Method not allowed.');
-    return htmlResponse(method === 'HEAD');
-  }
-  if (path === '/favicon.ico') return new Response(null, { status: 204, headers: BASE_HEADERS });
-  if (path.indexOf('/api/') !== 0) throw new HttpError(404, 'Not found.');
-
-  if (!env.DB) throw new HttpError(500, 'The D1 binding named DB is missing on this Worker.');
-  if (method !== 'GET') checkOrigin(request, url);
-  await ensureSchema(env);
-
-  switch (method + ' ' + path) {
-    case 'POST /api/register':
-      return handleRegister(request, env);
-    case 'POST /api/login':
-      return handleLogin(request, env);
-    case 'POST /api/logout':
-      return handleLogout(request, env);
-    case 'GET /api/me':
-      return handleMe(request, env);
-    case 'GET /api/messages':
-      return handleGetMessages(request, env, url);
-    case 'POST /api/messages':
-      return handlePostMessage(request, env);
-    case 'GET /api/admin/users':
-      return handleAdminUsers(request, env);
-    case 'GET /api/admin/messages':
-      return handleAdminGetMessages(request, env, url);
-    case 'POST /api/admin/messages':
-      return handleAdminPostMessage(request, env);
-    default:
-      throw new HttpError(404, 'Not found.');
-  }
-}
-
-export default {
-  async fetch(request, env) {
-    try {
-      return await route(request, env);
-    } catch (err) {
-      if (err instanceof HttpError) return json({ error: err.message }, err.status);
-      console.error('Unhandled error:', err && err.stack ? err.stack : err);
-      return json({ error: 'Internal server error.' }, 500);
-    }
-  }
-};
-
-/* ---------- frontend ---------- */
-
-function htmlResponse(headOnly) {
-  const nonce = bytesToHex(crypto.getRandomValues(new Uint8Array(16)));
-  const csp =
-    "default-src 'none'; script-src 'nonce-" + nonce + "'; style-src 'nonce-" + nonce + "'; " +
-    "connect-src 'self'; img-src 'self' data:; base-uri 'none'; form-action 'self'; frame-ancestors 'none'";
-  return new Response(headOnly ? null : PAGE.split('__NONCE__').join(nonce), {
-    status: 200,
-    headers: Object.assign({}, BASE_HEADERS, {
-      'Content-Type': 'text/html; charset=utf-8',
-      'Cache-Control': 'no-store',
-      'Content-Security-Policy': csp
-    })
-  });
-}
-
-// NOTE: this template literal must not contain backticks, backslashes or dollar-brace sequences.
-const PAGE = `<!doctype html>
 <html lang="en">
+
 <head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<meta name="color-scheme" content="dark">
-<meta name="theme-color" content="#050506">
-<title>Hello</title>
-<style nonce="__NONCE__">
-:root{--bg:#050506;--surface:#0f0f11;--raised:#18181b;--line:#27272c;--text:#ececee;--muted:#8d8d96;--faint:#5b5b63;--mine:#ececee;--mine-text:#0a0a0b;--danger:#ff8f86}
-*{box-sizing:border-box}
-html,body{height:100%;margin:0;background:var(--bg);color:var(--text);font:16px/1.45 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;-webkit-text-size-adjust:100%}
-[hidden]{display:none!important}
-button,input,textarea{font:inherit;color:inherit}
-:focus-visible{outline:2px solid #fff;outline-offset:2px}
-.app{height:100vh;height:100dvh;display:flex;flex-direction:column;max-width:760px;margin:0 auto;padding:env(safe-area-inset-top) 16px env(safe-area-inset-bottom)}
-.app.wide{max-width:1180px}
-.hero{padding:28px 0 18px;font-family:"Iowan Old Style","Palatino Linotype",Palatino,Georgia,serif}
-.hero h1{margin:0;font-weight:400;line-height:1.08}
-.hero span{display:block;font-size:clamp(2.3rem,10vw,3.9rem);letter-spacing:-.01em}
-.hero .l1{color:var(--text)}
-.hero .l2{color:var(--muted)}
-.hero .l3{color:var(--faint)}
-.app.chatting .hero{padding:14px 0 8px}
-.app.chatting .hero span{font-size:1.15rem;letter-spacing:0}
-.view{flex:1;min-height:0;display:flex;flex-direction:column}
-.card{background:var(--surface);border:1px solid var(--line);border-radius:22px;padding:22px;margin-top:6px}
-.card h2{margin:0 0 14px;font-size:1.1rem;font-weight:600}
-label{display:block;font-size:.88rem;color:var(--muted);margin:12px 0 6px}
-input[type=text],input[type=password]{width:100%;min-height:46px;padding:10px 14px;font-size:16px;background:var(--bg);border:1px solid var(--line);border-radius:14px}
-.hint{font-size:.82rem;color:var(--faint);margin:6px 0 0}
-.error{min-height:1.3em;margin:12px 0 0;color:var(--danger);font-size:.92rem}
-.btn{min-height:46px;padding:0 22px;border:0;border-radius:23px;background:var(--mine);color:var(--mine-text);font-weight:600;cursor:pointer}
-.btn:disabled{opacity:.5;cursor:default}
-.btn.block{width:100%;margin-top:6px}
-.btn.ghost{background:transparent;color:var(--muted);border:1px solid var(--line);font-weight:500;min-height:38px;padding:0 16px}
-.link{background:none;border:0;padding:12px 0 0;color:var(--muted);text-decoration:underline;cursor:pointer;font-size:.92rem}
-.bar{display:flex;justify-content:space-between;align-items:center;gap:12px;padding:10px 0}
-.bar h2{margin:0;font-family:"Iowan Old Style","Palatino Linotype",Georgia,serif;font-weight:400;font-size:1.6rem}
-.who{color:var(--muted);font-size:.9rem;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.thread{flex:1;min-height:0;overflow-y:auto;display:flex;flex-direction:column;gap:8px;padding:12px 0;overscroll-behavior:contain}
-.msg{max-width:82%;padding:9px 14px;border-radius:19px}
-.msg .text{white-space:pre-wrap;overflow-wrap:anywhere;word-break:break-word}
-.msg .time{font-size:.72rem;opacity:.6;margin-top:3px}
-.msg.mine{align-self:flex-end;background:var(--mine);color:var(--mine-text);border-bottom-right-radius:6px}
-.msg.theirs{align-self:flex-start;background:var(--raised);border-bottom-left-radius:6px}
-.empty{margin:auto;color:var(--faint);text-align:center;padding:0 24px}
-.composer{display:flex;gap:8px;align-items:flex-end;padding:10px 0 12px;border-top:1px solid var(--line)}
-.composer textarea{flex:1;resize:none;min-height:46px;max-height:140px;padding:11px 16px;font-size:16px;line-height:1.35;background:var(--surface);border:1px solid var(--line);border-radius:23px}
-.formerror{min-height:0;margin:0;padding:0 4px;color:var(--danger);font-size:.88rem}
-.admin{flex:1;min-height:0;display:grid;grid-template-columns:minmax(0,1fr);grid-template-rows:auto minmax(0,1fr);gap:12px}
-.userlist{max-height:28vh;max-height:28dvh;overflow-y:auto;display:flex;flex-direction:column;gap:6px;overscroll-behavior:contain}
-.uitem{display:flex;justify-content:space-between;align-items:center;gap:10px;width:100%;text-align:left;padding:10px 14px;background:var(--surface);border:1px solid var(--line);border-radius:14px;cursor:pointer}
-.uitem[aria-current=true]{background:var(--raised);border-color:#4a4a52}
-.uitem .n{font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.uitem .s{display:block;font-size:.76rem;color:var(--faint);font-weight:400}
-.badge{flex:none;font-size:.72rem;padding:2px 9px;border-radius:99px;background:var(--mine);color:var(--mine-text);font-weight:600}
-.convo{min-height:0;display:flex;flex-direction:column;border:1px solid var(--line);border-radius:18px;padding:0 14px;background:var(--bg)}
-.convo h3{margin:0;padding:12px 0 8px;font-size:1rem;border-bottom:1px solid var(--line)}
-@media (min-width:800px){
-  .admin{grid-template-columns:290px minmax(0,1fr);grid-template-rows:minmax(0,1fr)}
-  .userlist{max-height:none}
+
+<meta charset="UTF-8">
+
+<meta
+  name="viewport"
+  content="width=device-width, initial-scale=1.0"
+>
+
+<title>Private Chat</title>
+
+<style>
+
+* {
+  box-sizing: border-box;
 }
-@media (prefers-reduced-motion:reduce){*{scroll-behavior:auto!important}}
+
+body {
+  margin: 0;
+  background: #090b0f;
+  color: #f1f3f5;
+  font-family:
+    system-ui,
+    -apple-system,
+    BlinkMacSystemFont,
+    "Segoe UI",
+    sans-serif;
+}
+
+.container {
+  width: 100%;
+  max-width: 950px;
+  margin: auto;
+  padding: 20px;
+}
+
+.card {
+  background: #13171c;
+  border: 1px solid #252b32;
+  border-radius: 18px;
+  padding: 20px;
+  margin-bottom: 15px;
+}
+
+h1 {
+  margin: 0;
+  font-size: 32px;
+}
+
+h2 {
+  margin-top: 0;
+}
+
+h3 {
+  margin-top: 0;
+}
+
+.muted {
+  color: #9aa3ad;
+}
+
+input,
+textarea,
+button {
+  width: 100%;
+  padding: 12px;
+  border-radius: 12px;
+  border: 1px solid #303841;
+  background: #0c0f13;
+  color: white;
+  font: inherit;
+}
+
+input {
+  margin-bottom: 10px;
+}
+
+textarea {
+  min-height: 100px;
+  resize: vertical;
+}
+
+button {
+  background: #202730;
+  cursor: pointer;
+  margin-top: 10px;
+}
+
+button:hover {
+  background: #2c3540;
+}
+
+.row {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 15px;
+}
+
+.hidden {
+  display: none !important;
+}
+
+.top {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 10px;
+}
+
+.top button {
+  width: auto;
+}
+
+.profile-id {
+  margin-top: 5px;
+  color: #9aa3ad;
+}
+
+.profile-id strong {
+  color: white;
+  font-family: monospace;
+  letter-spacing: 1px;
+}
+
+.message {
+  padding: 12px 15px;
+  border-radius: 14px;
+  margin: 8px 0;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.message.mine {
+  background: #193522;
+}
+
+.message.theirs {
+  background: #202735;
+}
+
+.message.user {
+  background: #193522;
+}
+
+.message.admin {
+  background: #202735;
+}
+
+.timestamp {
+  font-size: 12px;
+  color: #89929d;
+  margin-top: 5px;
+}
+
+.status {
+  min-height: 22px;
+  color: #aab3bd;
+}
+
+.user-button {
+  text-align: left;
+  margin: 5px 0;
+}
+
+.request {
+  border: 1px solid #303841;
+  border-radius: 14px;
+  padding: 12px;
+  margin: 8px 0;
+}
+
+.request-actions {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+}
+
+.request-actions button {
+  margin-top: 8px;
+}
+
+.conversation-button {
+  text-align: left;
+}
+
+.small {
+  font-size: 13px;
+}
+
+.empty {
+  color: #7f8994;
+  padding: 10px 0;
+}
+
+@media (max-width: 650px) {
+
+  .row {
+    grid-template-columns: 1fr;
+  }
+
+  .container {
+    padding: 12px;
+  }
+
+  h1 {
+    font-size: 28px;
+  }
+
+}
+
 </style>
+
 </head>
+
 <body>
-<div id="app" class="app">
-  <header id="hero" class="hero" hidden>
-    <h1><span class="l1">Hello</span><span class="l2">I'm there</span><span class="l3">Say something</span></h1>
-  </header>
 
-  <div id="loadingView" class="view"></div>
+<div class="container">
 
-  <section id="authView" class="view" hidden>
-    <form id="authForm" class="card" novalidate>
-      <h2 id="authTitle">Log in</h2>
-      <label for="authUser">Username</label>
-      <input id="authUser" type="text" name="username" autocomplete="username" autocapitalize="none" autocorrect="off" spellcheck="false" maxlength="30">
-      <label for="authPass">Password</label>
-      <input id="authPass" type="password" name="password" autocomplete="current-password" maxlength="128">
-      <p id="authHint" class="hint" hidden>3-30 characters: letters, numbers and underscore. Password: at least 8 characters.</p>
-      <p id="authError" class="error" role="alert"></p>
-      <button id="authSubmit" class="btn block" type="submit">Log in</button>
-      <button id="authSwitch" class="link" type="button">Create an account</button>
-    </form>
-  </section>
+<div class="card">
 
-  <section id="userView" class="view" hidden>
-    <div class="bar">
-      <span id="userName" class="who"></span>
-      <button id="userLogout" class="btn ghost" type="button">Log out</button>
-    </div>
-    <div id="userThread" class="thread" aria-live="polite"></div>
-    <p id="userError" class="formerror" role="alert"></p>
-    <form id="userForm" class="composer">
-      <textarea id="userText" rows="1" maxlength="4000" placeholder="Say something" aria-label="Message"></textarea>
-      <button id="userSend" class="btn" type="submit">Send</button>
-    </form>
-  </section>
+<h1>Private Chat</h1>
 
-  <section id="adminView" class="view" hidden>
-    <div class="bar">
-      <h2>Admin Panel</h2>
-      <button id="adminLogout" class="btn ghost" type="button">Log out</button>
-    </div>
-    <div class="admin">
-      <nav id="userList" class="userlist" aria-label="Users"></nav>
-      <div class="convo">
-        <h3 id="convoTitle">Select a user</h3>
-        <div id="adminThread" class="thread" aria-live="polite"></div>
-        <p id="adminError" class="formerror" role="alert"></p>
-        <form id="adminForm" class="composer" hidden>
-          <textarea id="adminText" rows="1" maxlength="4000" placeholder="Write a reply" aria-label="Reply"></textarea>
-          <button id="adminSend" class="btn" type="submit">Reply</button>
-        </form>
-      </div>
-    </div>
-  </section>
+<div class="muted">
+Talk directly with another user.
 </div>
 
-<script nonce="__NONCE__">
-(function () {
-  'use strict';
+</div>
 
-  var POLL_MS = 5000;
-  var USERNAME_RE = /^[A-Za-z0-9_]{3,30}$/;
-  var $ = function (id) { return document.getElementById(id); };
-  var state = { me: null, mode: 'login', users: [], selected: null, lastId: 0, timer: null, tick: 0, inflight: false };
 
-  function api(method, path, body) {
-    var opts = { method: method, credentials: 'same-origin', headers: {} };
-    if (body !== undefined) {
-      opts.headers['Content-Type'] = 'application/json';
-      opts.body = JSON.stringify(body);
-    }
-    return fetch(path, opts).then(function (res) {
-      return res.json().catch(function () { return {}; }).then(function (data) {
-        if (!res.ok) {
-          var err = new Error(data.error || 'Something went wrong.');
-          err.status = res.status;
-          throw err;
+<!-- AUTH -->
+
+<div
+  id="auth"
+  class="card"
+>
+
+<div class="row">
+
+<div>
+
+<h2>Register</h2>
+
+<input
+  id="registerUsername"
+  placeholder="Username"
+  autocomplete="username"
+>
+
+<input
+  id="registerPassword"
+  type="password"
+  placeholder="Password (8+ characters)"
+  autocomplete="new-password"
+>
+
+<button onclick="registerUser()">
+Create account
+</button>
+
+</div>
+
+
+<div>
+
+<h2>Login</h2>
+
+<input
+  id="loginUsername"
+  placeholder="Username"
+  autocomplete="username"
+>
+
+<input
+  id="loginPassword"
+  type="password"
+  placeholder="Password"
+  autocomplete="current-password"
+>
+
+<button onclick="loginUser()">
+Login
+</button>
+
+</div>
+
+</div>
+
+<p
+  id="authStatus"
+  class="status"
+></p>
+
+</div>
+
+
+<!-- USER -->
+
+<div
+  id="userPanel"
+  class="hidden"
+>
+
+
+<div class="card top">
+
+<div>
+
+<div>
+Logged in as
+<strong id="currentUsername"></strong>
+</div>
+
+<div class="profile-id">
+Your ID:
+<strong id="currentPublicId"></strong>
+</div>
+
+</div>
+
+<button
+  onclick="logout()"
+  style="width:auto"
+>
+Logout
+</button>
+
+</div>
+
+
+<!-- FIND USER -->
+
+<div class="card">
+
+<h2>Start a conversation</h2>
+
+<p class="muted">
+You must enter both the exact username
+and the numeric ID of the person.
+</p>
+
+<input
+  id="targetUsername"
+  placeholder="Username"
+>
+
+<input
+  id="targetPublicId"
+  inputmode="numeric"
+  placeholder="Numeric User ID"
+>
+
+<button onclick="sendConversationRequest()">
+Send conversation request
+</button>
+
+<p
+  id="requestStatus"
+  class="status"
+></p>
+
+</div>
+
+
+<!-- REQUESTS -->
+
+<div class="card">
+
+<h3>
+Incoming requests
+</h3>
+
+<div id="incomingRequests"></div>
+
+</div>
+
+
+<!-- CONVERSATIONS -->
+
+<div class="card">
+
+<h3>
+My conversations
+</h3>
+
+<div id="conversationList"></div>
+
+</div>
+
+
+<!-- CHAT -->
+
+<div
+  id="userConversation"
+  class="card hidden"
+>
+
+<h3 id="conversationTitle">
+Conversation
+</h3>
+
+<div id="conversationMessages"></div>
+
+<textarea
+  id="conversationMessage"
+  maxlength="4000"
+  placeholder="Write a message..."
+></textarea>
+
+<button onclick="sendConversationMessage()">
+Send
+</button>
+
+</div>
+
+
+<!-- OLD ADMIN CHAT -->
+
+<div class="card">
+
+<h3>
+Administrator
+</h3>
+
+<div id="userMessages"></div>
+
+<textarea
+  id="userMessage"
+  maxlength="4000"
+  placeholder="Message the administrator..."
+></textarea>
+
+<button onclick="sendUserMessage()">
+Send to administrator
+</button>
+
+</div>
+
+
+</div>
+
+
+<!-- ADMIN -->
+
+<div
+  id="adminPanel"
+  class="hidden"
+>
+
+<div class="card top">
+
+<strong>
+Administrator Panel
+</strong>
+
+<button
+  onclick="logout()"
+  style="width:auto"
+>
+Logout
+</button>
+
+</div>
+
+
+<div class="card">
+
+<h3>
+Users
+</h3>
+
+<div id="userList"></div>
+
+</div>
+
+
+<div
+  id="adminConversation"
+  class="card hidden"
+>
+
+<h3 id="selectedUserTitle"></h3>
+
+<div id="adminMessages"></div>
+
+<textarea
+  id="adminMessage"
+  maxlength="4000"
+  placeholder="Reply..."
+></textarea>
+
+<button onclick="sendAdminMessage()">
+Reply
+</button>
+
+</div>
+
+</div>
+
+</div>
+
+
+<script>
+
+let selectedUserId = null;
+let selectedUsername = null;
+
+let selectedConversationId = null;
+
+
+async function api(
+  url,
+  options = {}
+) {
+
+  const response =
+    await fetch(
+      url,
+      {
+        ...options,
+
+        headers: {
+          "content-type":
+            "application/json",
+
+          ...(options.headers || {})
         }
-        return data;
-      });
-    });
-  }
-
-  function errText(err) {
-    return err && err.status ? err.message : 'Network problem. Check your connection and try again.';
-  }
-
-  function formatTime(ms) {
-    var d = new Date(ms);
-    try {
-      return d.toLocaleString([], { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' });
-    } catch (e) {
-      return d.toISOString();
-    }
-  }
-
-  function clearNode(node) {
-    while (node.firstChild) node.removeChild(node.firstChild);
-  }
-
-  function showEmpty(thread, text) {
-    var el = document.createElement('div');
-    el.className = 'empty';
-    el.textContent = text;
-    thread.appendChild(el);
-  }
-
-  function addMessages(thread, msgs, viewerRole, reset, emptyText) {
-    var nearBottom = thread.scrollHeight - thread.scrollTop - thread.clientHeight < 80;
-    if (reset) {
-      clearNode(thread);
-      state.lastId = 0;
-    }
-    var fresh = msgs.filter(function (m) { return m.id > state.lastId; });
-    var empty = thread.querySelector('.empty');
-    if (empty && fresh.length) thread.removeChild(empty);
-    fresh.forEach(function (m) {
-      var el = document.createElement('div');
-      el.className = 'msg ' + (m.sender_role === viewerRole ? 'mine' : 'theirs');
-      var text = document.createElement('div');
-      text.className = 'text';
-      text.textContent = m.body;
-      var time = document.createElement('div');
-      time.className = 'time';
-      time.textContent = formatTime(m.created_at);
-      el.appendChild(text);
-      el.appendChild(time);
-      thread.appendChild(el);
-      if (m.id > state.lastId) state.lastId = m.id;
-    });
-    if (!thread.firstChild) showEmpty(thread, emptyText);
-    if (reset || nearBottom) thread.scrollTop = thread.scrollHeight;
-  }
-
-  function showView(name) {
-    ['loadingView', 'authView', 'userView', 'adminView'].forEach(function (id) { $(id).hidden = id !== name; });
-    var cls = 'app';
-    if (name === 'userView') cls += ' chatting';
-    if (name === 'adminView') cls += ' wide';
-    $('app').className = cls;
-    $('hero').hidden = !(name === 'authView' || name === 'userView');
-  }
-
-  function autosize(ta) {
-    ta.style.height = 'auto';
-    ta.style.height = Math.min(ta.scrollHeight, 140) + 'px';
-  }
-
-  /* ----- auth ----- */
-
-  function setMode(mode) {
-    state.mode = mode;
-    var reg = mode === 'register';
-    $('authTitle').textContent = reg ? 'Create account' : 'Log in';
-    $('authSubmit').textContent = reg ? 'Create account' : 'Log in';
-    $('authSwitch').textContent = reg ? 'I already have an account' : 'Create an account';
-    $('authPass').setAttribute('autocomplete', reg ? 'new-password' : 'current-password');
-    $('authHint').hidden = !reg;
-    $('authError').textContent = '';
-  }
-
-  function resetToAuth(message) {
-    clearTimeout(state.timer);
-    state.me = null;
-    state.selected = null;
-    state.users = [];
-    state.lastId = 0;
-    clearNode($('userThread'));
-    clearNode($('adminThread'));
-    clearNode($('userList'));
-    $('userText').value = '';
-    $('adminText').value = '';
-    $('authPass').value = '';
-    $('convoTitle').textContent = 'Select a user';
-    $('adminForm').hidden = true;
-    $('userError').textContent = '';
-    $('adminError').textContent = '';
-    setMode('login');
-    $('authError').textContent = message || '';
-    showView('authView');
-  }
-
-  function guard(err) {
-    if (err && err.status === 401 && state.me) {
-      resetToAuth('Your session ended. Please log in again.');
-      return true;
-    }
-    return false;
-  }
-
-  $('authSwitch').addEventListener('click', function () {
-    setMode(state.mode === 'login' ? 'register' : 'login');
-  });
-
-  $('authForm').addEventListener('submit', function (e) {
-    e.preventDefault();
-    var username = $('authUser').value.trim();
-    var password = $('authPass').value;
-    var err = $('authError');
-    err.textContent = '';
-    if (!username || !password) { err.textContent = 'Enter your username and password.'; return; }
-    if (state.mode === 'register') {
-      if (!USERNAME_RE.test(username)) { err.textContent = 'Username must be 3-30 characters: letters, numbers and underscore only.'; return; }
-      if (password.length < 8) { err.textContent = 'Password must be at least 8 characters.'; return; }
-    }
-    var btn = $('authSubmit');
-    btn.disabled = true;
-    api('POST', state.mode === 'register' ? '/api/register' : '/api/login', { username: username, password: password })
-      .then(function (data) {
-        $('authPass').value = '';
-        enter(data.user);
-      })
-      .catch(function (e2) { err.textContent = errText(e2); })
-      .then(function () { btn.disabled = false; });
-  });
-
-  function logout() {
-    api('POST', '/api/logout').catch(function () {}).then(function () { resetToAuth(''); });
-  }
-  $('userLogout').addEventListener('click', logout);
-  $('adminLogout').addEventListener('click', logout);
-
-  /* ----- entering a session ----- */
-
-  function enter(me) {
-    state.me = me;
-    state.tick = 0;
-    state.lastId = 0;
-    if (me.role === 'admin') {
-      showView('adminView');
-      loadUsers();
-    } else {
-      $('userName').textContent = me.username;
-      showView('userView');
-      loadUserMessages(true);
-    }
-    schedule();
-  }
-
-  function schedule() {
-    clearTimeout(state.timer);
-    state.timer = setTimeout(poll, POLL_MS);
-  }
-
-  function poll() {
-    if (!state.me) return;
-    if (document.hidden) { schedule(); return; }
-    state.tick += 1;
-    var jobs = [];
-    if (state.me.role === 'admin') {
-      if (state.tick % 3 === 0) jobs.push(loadUsers());
-      if (state.selected) jobs.push(loadConversation(false));
-    } else {
-      jobs.push(loadUserMessages(false));
-    }
-    Promise.all(jobs).then(schedule, schedule);
-  }
-
-  document.addEventListener('visibilitychange', function () {
-    if (!document.hidden && state.me) {
-      clearTimeout(state.timer);
-      poll();
-    }
-  });
-
-  /* ----- user view ----- */
-
-  function loadUserMessages(reset) {
-    var path = '/api/messages' + (reset ? '' : '?after=' + state.lastId);
-    return api('GET', path).then(function (data) {
-      if (!state.me || state.me.role !== 'user') return;
-      addMessages($('userThread'), data.messages || [], 'user', reset, 'No messages yet. Say something below.');
-    }).catch(function (err) { guard(err); });
-  }
-
-  $('userText').addEventListener('input', function () { autosize($('userText')); });
-  $('userText').addEventListener('keydown', function (e) {
-    if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); $('userSend').click(); }
-  });
-
-  $('userForm').addEventListener('submit', function (e) {
-    e.preventDefault();
-    var ta = $('userText');
-    var body = ta.value.trim();
-    var err = $('userError');
-    err.textContent = '';
-    if (!body) return;
-    var btn = $('userSend');
-    btn.disabled = true;
-    api('POST', '/api/messages', { body: body })
-      .then(function (data) {
-        ta.value = '';
-        autosize(ta);
-        addMessages($('userThread'), [data.message], 'user', false, '');
-        ta.focus();
-      })
-      .catch(function (e2) { if (!guard(e2)) err.textContent = errText(e2); })
-      .then(function () { btn.disabled = false; });
-  });
-
-  /* ----- admin view ----- */
-
-  function renderUsers() {
-    var list = $('userList');
-    clearNode(list);
-    if (!state.users.length) {
-      var none = document.createElement('div');
-      none.className = 'empty';
-      none.textContent = 'No users have registered yet.';
-      list.appendChild(none);
-      return;
-    }
-    state.users.forEach(function (u) {
-      var b = document.createElement('button');
-      b.type = 'button';
-      b.className = 'uitem';
-      if (u.id === state.selected) b.setAttribute('aria-current', 'true');
-      var left = document.createElement('span');
-      var name = document.createElement('span');
-      name.className = 'n';
-      name.textContent = u.username;
-      var sub = document.createElement('span');
-      sub.className = 's';
-      sub.textContent = u.message_count ? (u.message_count + ' messages, last ' + formatTime(u.last_message_at)) : 'No messages yet';
-      left.appendChild(name);
-      left.appendChild(sub);
-      b.appendChild(left);
-      if (u.last_sender === 'user') {
-        var badge = document.createElement('span');
-        badge.className = 'badge';
-        badge.textContent = 'Needs reply';
-        b.appendChild(badge);
       }
-      b.addEventListener('click', function () { selectUser(u); });
-      list.appendChild(b);
-    });
+    );
+
+  let data = {};
+
+  try {
+    data =
+      await response.json();
+  } catch (_) {}
+
+  if (!response.ok) {
+
+    throw new Error(
+      data.error ||
+      "Request failed"
+    );
+
   }
 
-  function loadUsers() {
-    return api('GET', '/api/admin/users').then(function (data) {
-      if (!state.me || state.me.role !== 'admin') return;
-      state.users = data.users || [];
-      renderUsers();
-    }).catch(function (err) { guard(err); });
+  return data;
+}
+
+
+function escapeHTML(value) {
+
+  return String(value).replace(
+    /[&<>"']/g,
+    character => ({
+      "&": "&amp;",
+      "<": "&lt;",
+      ">": "&gt;",
+      '"': "&quot;",
+      "'": "&#039;"
+    })[character]
+  );
+
+}
+
+
+function setAuthStatus(
+  message
+) {
+
+  document
+    .getElementById(
+      "authStatus"
+    )
+    .textContent =
+      message;
+
+}
+
+
+async function registerUser() {
+
+  const username =
+    document
+      .getElementById(
+        "registerUsername"
+      )
+      .value
+      .trim();
+
+  const password =
+    document
+      .getElementById(
+        "registerPassword"
+      )
+      .value;
+
+  try {
+
+    const result =
+      await api(
+        "/api/register",
+        {
+          method: "POST",
+
+          body:
+            JSON.stringify({
+              username,
+              password
+            })
+        }
+      );
+
+    setAuthStatus(
+      "Account created. Your numeric ID is " +
+      result.public_id +
+      ". You can now log in."
+    );
+
+  } catch (error) {
+
+    setAuthStatus(
+      error.message
+    );
+
   }
 
-  function selectUser(u) {
-    state.selected = u.id;
-    $('convoTitle').textContent = u.username;
-    $('adminForm').hidden = false;
-    $('adminError').textContent = '';
-    clearNode($('adminThread'));
-    state.lastId = 0;
-    renderUsers();
-    loadConversation(true);
+}
+
+
+async function loginUser() {
+
+  const username =
+    document
+      .getElementById(
+        "loginUsername"
+      )
+      .value
+      .trim();
+
+  const password =
+    document
+      .getElementById(
+        "loginPassword"
+      )
+      .value;
+
+  try {
+
+    await api(
+      "/api/login",
+      {
+        method: "POST",
+
+        body:
+          JSON.stringify({
+            username,
+            password
+          })
+      }
+    );
+
+    await loadCurrentUser();
+
+  } catch (error) {
+
+    setAuthStatus(
+      error.message
+    );
+
   }
 
-  function loadConversation(reset) {
-    var uid = state.selected;
-    if (!uid) return Promise.resolve();
-    var path = '/api/admin/messages?user_id=' + uid + (reset ? '' : '&after=' + state.lastId);
-    return api('GET', path).then(function (data) {
-      if (state.selected !== uid) return; // user switched while loading
-      addMessages($('adminThread'), data.messages || [], 'admin', reset, 'No messages from this user yet.');
-    }).catch(function (err) { guard(err); });
+}
+
+
+async function loadCurrentUser() {
+
+  const data =
+    await api(
+      "/api/me"
+    );
+
+  document
+    .getElementById("auth")
+    .classList
+    .add("hidden");
+
+
+  if (
+    data.role === "admin"
+  ) {
+
+    document
+      .getElementById(
+        "adminPanel"
+      )
+      .classList
+      .remove("hidden");
+
+    await loadUsers();
+
+    return;
   }
 
-  $('adminText').addEventListener('input', function () { autosize($('adminText')); });
-  $('adminText').addEventListener('keydown', function (e) {
-    if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); $('adminSend').click(); }
-  });
 
-  $('adminForm').addEventListener('submit', function (e) {
-    e.preventDefault();
-    var ta = $('adminText');
-    var body = ta.value.trim();
-    var err = $('adminError');
-    err.textContent = '';
-    if (!body || !state.selected) return;
-    var uid = state.selected;
-    var btn = $('adminSend');
-    btn.disabled = true;
-    api('POST', '/api/admin/messages', { user_id: uid, body: body })
-      .then(function (data) {
-        ta.value = '';
-        autosize(ta);
-        if (state.selected === uid) addMessages($('adminThread'), [data.message], 'admin', false, '');
-        ta.focus();
-        loadUsers();
+  document
+    .getElementById(
+      "userPanel"
+    )
+    .classList
+    .remove("hidden");
+
+
+  document
+    .getElementById(
+      "currentUsername"
+    )
+    .textContent =
+      data.username;
+
+
+  document
+    .getElementById(
+      "currentPublicId"
+    )
+    .textContent =
+      data.public_id;
+
+
+  await Promise.all([
+    loadUserMessages(),
+    loadIncomingRequests(),
+    loadConversations()
+  ]);
+
+}
+
+
+async function logout() {
+
+  try {
+
+    await api(
+      "/api/logout",
+      {
+        method: "POST"
+      }
+    );
+
+  } finally {
+
+    location.reload();
+
+  }
+
+}
+
+
+/*
+==================================================
+USER -> USER REQUEST
+==================================================
+*/
+
+async function sendConversationRequest() {
+
+  const username =
+    document
+      .getElementById(
+        "targetUsername"
+      )
+      .value
+      .trim();
+
+  const publicId =
+    document
+      .getElementById(
+        "targetPublicId"
+      )
+      .value
+      .trim();
+
+
+  const status =
+    document
+      .getElementById(
+        "requestStatus"
+      );
+
+
+  status.textContent =
+    "";
+
+
+  try {
+
+    const result =
+      await api(
+        "/api/conversations/request",
+        {
+          method: "POST",
+
+          body:
+            JSON.stringify({
+              username,
+              public_id: publicId
+            })
+        }
+      );
+
+
+    status.textContent =
+      result.message ||
+      "Conversation request sent.";
+
+    document
+      .getElementById(
+        "targetUsername"
+      )
+      .value = "";
+
+    document
+      .getElementById(
+        "targetPublicId"
+      )
+      .value = "";
+
+
+    await loadConversations();
+
+  } catch (error) {
+
+    status.textContent =
+      error.message;
+
+  }
+
+}
+
+
+/*
+==================================================
+INCOMING REQUESTS
+==================================================
+*/
+
+async function loadIncomingRequests() {
+
+  const data =
+    await api(
+      "/api/conversations/requests"
+    );
+
+
+  const container =
+    document
+      .getElementById(
+        "incomingRequests"
+      );
+
+
+  if (
+    !data.requests.length
+  ) {
+
+    container.innerHTML =
+      '<div class="empty">No pending requests.</div>';
+
+    return;
+  }
+
+
+  container.innerHTML =
+    data.requests
+      .map(request => {
+
+        return \`
+          <div class="request">
+
+            <strong>
+              \${escapeHTML(request.username)}
+            </strong>
+
+            <div class="muted small">
+              ID:
+              \${escapeHTML(request.public_id)}
+            </div>
+
+            <div class="request-actions">
+
+              <button
+                onclick="respondToRequest(\${request.id}, 'accepted')"
+              >
+                Accept
+              </button>
+
+              <button
+                onclick="respondToRequest(\${request.id}, 'rejected')"
+              >
+                Reject
+              </button>
+
+            </div>
+
+          </div>
+        \`;
+
       })
-      .catch(function (e2) { if (!guard(e2)) err.textContent = errText(e2); })
-      .then(function () { btn.disabled = false; });
-  });
+      .join("");
 
-  /* ----- boot ----- */
+}
 
-  setMode('login');
-  api('GET', '/api/me')
-    .then(function (data) { enter(data.user); })
-    .catch(function (err) {
-      resetToAuth(err && !err.status ? errText(err) : '');
-    });
-})();
+
+async function respondToRequest(
+  conversationId,
+  status
+) {
+
+  try {
+
+    await api(
+      "/api/conversations/respond",
+      {
+        method: "POST",
+
+        body:
+          JSON.stringify({
+            conversation_id:
+              conversationId,
+
+            status
+          })
+      }
+    );
+
+
+    await loadIncomingRequests();
+    await loadConversations();
+
+  } catch (error) {
+
+    alert(
+      error.message
+    );
+
+  }
+
+}
+
+
+/*
+==================================================
+CONVERSATIONS
+==================================================
+*/
+
+async function loadConversations() {
+
+  const data =
+    await api(
+      "/api/conversations"
+    );
+
+
+  const container =
+    document
+      .getElementById(
+        "conversationList"
+      );
+
+
+  if (
+    !data.conversations.length
+  ) {
+
+    container.innerHTML =
+      '<div class="empty">No active conversations.</div>';
+
+    return;
+  }
+
+
+  container.innerHTML =
+    data.conversations
+      .map(conversation => {
+
+        return \`
+          <button
+            class="conversation-button"
+            onclick="openConversation(\${conversation.id})"
+          >
+
+            <strong>
+              \${escapeHTML(conversation.username)}
+            </strong>
+
+            <span class="muted">
+              —
+              ID:
+              \${escapeHTML(conversation.public_id)}
+            </span>
+
+          </button>
+        \`;
+
+      })
+      .join("");
+
+}
+
+
+async function openConversation(
+  conversationId
+) {
+
+  selectedConversationId =
+    conversationId;
+
+
+  const data =
+    await api(
+      "/api/conversations/" +
+      encodeURIComponent(
+        conversationId
+      )
+    );
+
+
+  document
+    .getElementById(
+      "userConversation"
+    )
+    .classList
+    .remove("hidden");
+
+
+  document
+    .getElementById(
+      "conversationTitle"
+    )
+    .textContent =
+      "Conversation with " +
+      data.user.username +
+      " (" +
+      data.user.public_id +
+      ")";
+
+
+  renderConversationMessages(
+    data.messages
+  );
+
+}
+
+
+function renderConversationMessages(
+  messages
+) {
+
+  const container =
+    document
+      .getElementById(
+        "conversationMessages"
+      );
+
+
+  container.innerHTML =
+    messages
+      .map(message => {
+
+        const mine =
+          message.mine;
+
+
+        return \`
+          <div
+            class="message \${mine ? "mine" : "theirs"}"
+          >
+
+            <div>
+              \${escapeHTML(message.body)}
+            </div>
+
+            <div class="timestamp">
+              \${new Date(
+                message.created_at
+              ).toLocaleString()}
+            </div>
+
+          </div>
+        \`;
+
+      })
+      .join("");
+
+
+  container.scrollTop =
+    container.scrollHeight;
+
+}
+
+
+async function sendConversationMessage() {
+
+  if (
+    !selectedConversationId
+  ) {
+    return;
+  }
+
+
+  const input =
+    document
+      .getElementById(
+        "conversationMessage"
+      );
+
+
+  const body =
+    input.value.trim();
+
+
+  if (!body) {
+    return;
+  }
+
+
+  try {
+
+    await api(
+      "/api/conversations/message",
+      {
+        method: "POST",
+
+        body:
+          JSON.stringify({
+            conversation_id:
+              selectedConversationId,
+
+            body
+          })
+      }
+    );
+
+
+    input.value = "";
+
+    await openConversation(
+      selectedConversationId
+    );
+
+  } catch (error) {
+
+    alert(
+      error.message
+    );
+
+  }
+
+}
+
+
+/*
+==================================================
+OLD ADMIN CHAT
+==================================================
+*/
+
+async function loadUserMessages() {
+
+  const data =
+    await api(
+      "/api/messages"
+    );
+
+
+  const container =
+    document
+      .getElementById(
+        "userMessages"
+      );
+
+
+  container.innerHTML =
+    data.messages
+      .map(message => {
+
+        return \`
+          <div
+            class="message \${message.sender_role}"
+          >
+
+            <div>
+              \${escapeHTML(message.body)}
+            </div>
+
+            <div class="timestamp">
+              \${new Date(
+                message.created_at
+              ).toLocaleString()}
+            </div>
+
+          </div>
+        \`;
+
+      })
+      .join("");
+
+}
+
+
+async function sendUserMessage() {
+
+  const input =
+    document
+      .getElementById(
+        "userMessage"
+      );
+
+
+  const body =
+    input.value.trim();
+
+
+  if (!body) {
+    return;
+  }
+
+
+  try {
+
+    await api(
+      "/api/messages",
+      {
+        method: "POST",
+
+        body:
+          JSON.stringify({
+            body
+          })
+      }
+    );
+
+
+    input.value = "";
+
+    await loadUserMessages();
+
+  } catch (error) {
+
+    alert(
+      error.message
+    );
+
+  }
+
+}
+
+
+/*
+==================================================
+ADMIN
+==================================================
+*/
+
+async function loadUsers() {
+
+  const data =
+    await api(
+      "/api/admin/users"
+    );
+
+
+  const container =
+    document
+      .getElementById(
+        "userList"
+      );
+
+
+  if (
+    !data.users.length
+  ) {
+
+    container.innerHTML =
+      '<div class="muted">No users yet.</div>';
+
+    return;
+  }
+
+
+  container.innerHTML =
+    data.users
+      .map(user => {
+
+        return \`
+          <button
+            class="user-button"
+            onclick="selectUser(\${user.id})"
+          >
+
+            <strong>
+              \${escapeHTML(user.username)}
+            </strong>
+
+            <div class="muted small">
+              ID:
+              \${escapeHTML(user.public_id)}
+            </div>
+
+          </button>
+        \`;
+
+      })
+      .join("");
+
+}
+
+
+async function selectUser(
+  userId
+) {
+
+  const data =
+    await api(
+      "/api/admin/users"
+    );
+
+
+  const user =
+    data.users.find(
+      item =>
+        item.id === userId
+    );
+
+
+  if (!user) {
+    return;
+  }
+
+
+  selectedUserId =
+    user.id;
+
+  selectedUsername =
+    user.username;
+
+
+  document
+    .getElementById(
+      "adminConversation"
+    )
+    .classList
+    .remove("hidden");
+
+
+  document
+    .getElementById(
+      "selectedUserTitle"
+    )
+    .textContent =
+      "Conversation with " +
+      user.username +
+      " (" +
+      user.public_id +
+      ")";
+
+
+  await loadAdminMessages();
+
+}
+
+
+async function loadAdminMessages() {
+
+  if (!selectedUserId) {
+    return;
+  }
+
+
+  const data =
+    await api(
+      "/api/admin/messages?user_id=" +
+      encodeURIComponent(
+        selectedUserId
+      )
+    );
+
+
+  const container =
+    document
+      .getElementById(
+        "adminMessages"
+      );
+
+
+  container.innerHTML =
+    data.messages
+      .map(message => {
+
+        return \`
+          <div
+            class="message \${message.sender_role}"
+          >
+
+            <div>
+              \${escapeHTML(message.body)}
+            </div>
+
+            <div class="timestamp">
+              \${new Date(
+                message.created_at
+              ).toLocaleString()}
+            </div>
+
+          </div>
+        \`;
+
+      })
+      .join("");
+
+}
+
+
+async function sendAdminMessage() {
+
+  if (!selectedUserId) {
+    return;
+  }
+
+
+  const input =
+    document
+      .getElementById(
+        "adminMessage"
+      );
+
+
+  const body =
+    input.value.trim();
+
+
+  if (!body) {
+    return;
+  }
+
+
+  try {
+
+    await api(
+      "/api/admin/messages",
+      {
+        method: "POST",
+
+        body:
+          JSON.stringify({
+            user_id:
+              selectedUserId,
+
+            body
+          })
+      }
+    );
+
+
+    input.value = "";
+
+    await loadAdminMessages();
+
+  } catch (error) {
+
+    alert(
+      error.message
+    );
+
+  }
+
+}
+
+
+/*
+==================================================
+INITIALIZE
+==================================================
+*/
+
+async function initialize() {
+
+  try {
+
+    await loadCurrentUser();
+
+  } catch (_) {
+
+    // Not logged in.
+
+  }
+
+}
+
+initialize();
+
+
+/*
+==================================================
+AUTO REFRESH
+==================================================
+*/
+
+setInterval(
+  async () => {
+
+    try {
+
+      const auth =
+        document
+          .getElementById(
+            "auth"
+          );
+
+
+      if (
+        !auth.classList.contains(
+          "hidden"
+        )
+      ) {
+        return;
+      }
+
+
+      const adminPanel =
+        document
+          .getElementById(
+            "adminPanel"
+          );
+
+
+      if (
+        adminPanel.classList.contains(
+          "hidden"
+        )
+      ) {
+
+        await loadIncomingRequests();
+
+        await loadConversations();
+
+        await loadUserMessages();
+
+
+        if (
+          selectedConversationId
+        ) {
+
+          await openConversation(
+            selectedConversationId
+          );
+
+        }
+
+      } else {
+
+        await loadUsers();
+
+
+        if (
+          selectedUserId
+        ) {
+
+          await loadAdminMessages();
+
+        }
+
+      }
+
+    } catch (_) {}
+
+  },
+  5000
+);
+
 </script>
+
 </body>
+
 </html>`;
+
+
+/*
+==================================================
+WORKER
+==================================================
+*/
+
+export default {
+
+  async fetch(
+    request,
+    env
+  ) {
+
+    try {
+
+      if (!env.DB) {
+
+        return json(
+          {
+            error:
+              "D1 binding DB is missing."
+          },
+          500
+        );
+
+      }
+
+
+      await initDB(
+        env.DB
+      );
+
+
+      const url =
+        new URL(
+          request.url
+        );
+
+      const path =
+        url.pathname;
+
+
+      /*
+      ==============================================
+      FRONTEND
+      ==============================================
+      */
+
+      if (
+        request.method === "GET" &&
+        path === "/"
+      ) {
+
+        return html(
+          PAGE
+        );
+
+      }
+
+
+      /*
+      ==============================================
+      REGISTER
+      ==============================================
+      */
+
+      if (
+        request.method === "POST" &&
+        path === "/api/register"
+      ) {
+
+        const {
+          username,
+          password
+        } =
+          await request.json();
+
+
+        if (
+          !/^[A-Za-z0-9_]{3,30}$/.test(
+            username || ""
+          )
+        ) {
+
+          return json(
+            {
+              error:
+                "Username must contain 3-30 letters, numbers, or underscore."
+            },
+            400
+          );
+
+        }
+
+
+        if (
+          !password ||
+          password.length < 8
+        ) {
+
+          return json(
+            {
+              error:
+                "Password must be at least 8 characters."
+            },
+            400
+          );
+
+        }
+
+
+        const existing =
+          await env.DB.prepare(`
+            SELECT id
+            FROM users
+            WHERE username = ?
+          `)
+            .bind(
+              username
+            )
+            .first();
+
+
+        if (existing) {
+
+          return json(
+            {
+              error:
+                "Username already exists."
+            },
+            409
+          );
+
+        }
+
+
+        let publicId = null;
+
+
+        for (
+          let attempt = 0;
+          attempt < 30;
+          attempt++
+        ) {
+
+          const candidate =
+            randomPublicId();
+
+
+          const exists =
+            await env.DB.prepare(`
+              SELECT id
+              FROM users
+              WHERE public_id = ?
+            `)
+              .bind(candidate)
+              .first();
+
+
+          if (!exists) {
+
+            publicId =
+              candidate;
+
+            break;
+
+          }
+
+        }
+
+
+        if (
+          publicId === null
+        ) {
+
+          return json(
+            {
+              error:
+                "Could not generate a unique user ID."
+            },
+            500
+          );
+
+        }
+
+
+        const passwordHash =
+          await hashPassword(
+            password
+          );
+
+
+        await env.DB.prepare(`
+          INSERT INTO users
+          (
+            username,
+            password_hash,
+            role,
+            created_at,
+            public_id
+          )
+          VALUES (?, ?, ?, ?, ?)
+        `)
+          .bind(
+            username,
+            passwordHash,
+            "user",
+            Date.now(),
+            publicId
+          )
+          .run();
+
+
+        return json(
+          {
+            ok: true,
+            username,
+            public_id:
+              publicId
+          }
+        );
+
+      }
+
+
+      /*
+      ==============================================
+      LOGIN
+      ==============================================
+      */
+
+      if (
+        request.method === "POST" &&
+        path === "/api/login"
+      ) {
+
+        const {
+          username,
+          password
+        } =
+          await request.json();
+
+
+        /*
+        ADMIN
+        */
+
+        if (
+          username === "admin"
+        ) {
+
+          if (
+            typeof env.ADMIN_PASSWORD !==
+            "string" ||
+            !env.ADMIN_PASSWORD
+          ) {
+
+            return json(
+              {
+                error:
+                  "ADMIN_PASSWORD secret is not configured on this Worker."
+              },
+              500
+            );
+
+          }
+
+
+          if (
+            password !==
+            env.ADMIN_PASSWORD
+          ) {
+
+            return json(
+              {
+                error:
+                  "Invalid admin password."
+              },
+              401
+            );
+
+          }
+
+
+          const token =
+            randHex(32);
+
+
+          await env.DB.prepare(`
+            INSERT OR REPLACE INTO sessions
+            (
+              token,
+              user_id,
+              role,
+              expires_at
+            )
+            VALUES (?, ?, ?, ?)
+          `)
+            .bind(
+              token,
+              0,
+              "admin",
+              Date.now() +
+              SESSION_DAYS *
+              86400000
+            )
+            .run();
+
+
+          return json(
+            {
+              ok: true,
+              role: "admin",
+              username: "admin"
+            },
+            200,
+            {
+              "set-cookie":
+                sessionCookie(
+                  token
+                )
+            }
+          );
+
+        }
+
+
+        /*
+        NORMAL USER
+        */
+
+        const user =
+          await env.DB.prepare(`
+            SELECT
+              id,
+              username,
+              public_id,
+              password_hash,
+              role
+            FROM users
+            WHERE username = ?
+          `)
+            .bind(
+              username || ""
+            )
+            .first();
+
+
+        if (!user) {
+
+          return json(
+            {
+              error:
+                "Invalid username or password."
+            },
+            401
+          );
+
+        }
+
+
+        const valid =
+          await verifyPassword(
+            password || "",
+            user.password_hash
+          );
+
+
+        if (!valid) {
+
+          return json(
+            {
+              error:
+                "Invalid username or password."
+            },
+            401
+          );
+
+        }
+
+
+        const token =
+          randHex(32);
+
+
+        await env.DB.prepare(`
+          INSERT INTO sessions
+          (
+            token,
+            user_id,
+            role,
+            expires_at
+          )
+          VALUES (?, ?, ?, ?)
+        `)
+          .bind(
+            token,
+            user.id,
+            "user",
+            Date.now() +
+            SESSION_DAYS *
+            86400000
+          )
+          .run();
+
+
+        return json(
+          {
+            ok: true,
+            role: "user",
+            username:
+              user.username,
+            public_id:
+              user.public_id
+          },
+          200,
+          {
+            "set-cookie":
+              sessionCookie(
+                token
+              )
+          }
+        );
+
+      }
+
+
+      /*
+      ==============================================
+      LOGOUT
+      ==============================================
+      */
+
+      if (
+        request.method === "POST" &&
+        path === "/api/logout"
+      ) {
+
+        const token =
+          getSessionToken(
+            request
+          );
+
+
+        if (token) {
+
+          await env.DB.prepare(`
+            DELETE FROM sessions
+            WHERE token = ?
+          `)
+            .bind(token)
+            .run();
+
+        }
+
+
+        return json(
+          {
+            ok: true
+          },
+          200,
+          {
+            "set-cookie":
+              deleteSessionCookie()
+          }
+        );
+
+      }
+
+
+      /*
+      ==============================================
+      CURRENT USER
+      ==============================================
+      */
+
+      if (
+        request.method === "GET" &&
+        path === "/api/me"
+      ) {
+
+        const session =
+          await getSession(
+            request,
+            env
+          );
+
+
+        if (!session) {
+
+          return json(
+            {
+              authenticated:
+                false
+            },
+            401
+          );
+
+        }
+
+
+        if (
+          session.role === "admin"
+        ) {
+
+          return json({
+            authenticated:
+              true,
+
+            role:
+              "admin",
+
+            username:
+              "admin"
+          });
+
+        }
+
+
+        const user =
+          await env.DB.prepare(`
+            SELECT
+              username,
+              public_id
+            FROM users
+            WHERE id = ?
+          `)
+            .bind(
+              session.user_id
+            )
+            .first();
+
+
+        return json({
+          authenticated:
+            true,
+
+          role:
+            "user",
+
+          username:
+            user?.username ||
+            "user",
+
+          public_id:
+            user?.public_id ||
+            null
+        });
+
+      }
+
+
+      /*
+      ==================================================
+      SEND USER -> ADMIN MESSAGE
+      ==================================================
+      */
+
+      if (
+        request.method === "GET" &&
+        path === "/api/messages"
+      ) {
+
+        const session =
+          await requireUser(
+            request,
+            env
+          );
+
+
+        if (!session) {
+
+          return json(
+            {
+              error:
+                "Unauthorized"
+            },
+            401
+          );
+
+        }
+
+
+        const rows =
+          await env.DB.prepare(`
+            SELECT
+              id,
+              sender_role,
+              body,
+              created_at
+            FROM messages
+            WHERE user_id = ?
+            ORDER BY id ASC
+          `)
+            .bind(
+              session.user_id
+            )
+            .all();
+
+
+        return json({
+          messages:
+            rows.results ||
+            []
+        });
+
+      }
+
+
+      if (
+        request.method === "POST" &&
+        path === "/api/messages"
+      ) {
+
+        const session =
+          await requireUser(
+            request,
+            env
+          );
+
+
+        if (!session) {
+
+          return json(
+            {
+              error:
+                "Unauthorized"
+            },
+            401
+          );
+
+        }
+
+
+        const {
+          body
+        } =
+          await request.json();
+
+
+        if (
+          typeof body !==
+            "string" ||
+          !body.trim() ||
+          body.length >
+            MAX_MESSAGE
+        ) {
+
+          return json(
+            {
+              error:
+                "Invalid message."
+            },
+            400
+          );
+
+        }
+
+
+        await env.DB.prepare(`
+          INSERT INTO messages
+          (
+            user_id,
+            sender_role,
+            body,
+            created_at
+          )
+          VALUES (?, ?, ?, ?)
+        `)
+          .bind(
+            session.user_id,
+            "user",
+            body.trim(),
+            Date.now()
+          )
+          .run();
+
+
+        return json({
+          ok: true
+        });
+
+      }
+
+
+      /*
+      ==================================================
+      USER-TO-USER
+      SEND REQUEST
+      ==================================================
+      */
+
+      if (
+        request.method === "POST" &&
+        path === "/api/conversations/request"
+      ) {
+
+        const session =
+          await requireUser(
+            request,
+            env
+          );
+
+
+        if (!session) {
+
+          return json(
+            {
+              error:
+                "Unauthorized"
+            },
+            401
+          );
+
+        }
+
+
+        const {
+          username,
+          public_id
+        } =
+          await request.json();
+
+
+        const targetUsername =
+          String(
+            username || ""
+          ).trim();
+
+
+        const targetPublicId =
+          Number(
+            public_id
+          );
+
+
+        if (
+          !targetUsername ||
+          !Number.isInteger(
+            targetPublicId
+          )
+        ) {
+
+          return json(
+            {
+              error:
+                "Both username and numeric user ID are required."
+            },
+            400
+          );
+
+        }
+
+
+        const target =
+          await getUserByPublicIdAndUsername(
+            env.DB,
+            targetUsername,
+            targetPublicId
+          );
+
+
+        if (!target) {
+
+          return json(
+            {
+              error:
+                "Username and ID do not match any user."
+            },
+            404
+          );
+
+        }
+
+
+        if (
+          target.id ===
+          session.user_id
+        ) {
+
+          return json(
+            {
+              error:
+                "You cannot start a conversation with yourself."
+            },
+            400
+          );
+
+        }
+
+
+        const [
+          userA,
+          userB
+        ] =
+          normalizePair(
+            session.user_id,
+            target.id
+          );
+
+
+        const existing =
+          await env.DB.prepare(`
+            SELECT *
+            FROM conversations
+            WHERE user_a = ?
+              AND user_b = ?
+          `)
+            .bind(
+              userA,
+              userB
+            )
+            .first();
+
+
+        if (existing) {
+
+          if (
+            existing.status ===
+            "accepted"
+          ) {
+
+            return json(
+              {
+                error:
+                  "A conversation with this user already exists."
+              },
+              409
+            );
+
+          }
+
+
+          if (
+            existing.status ===
+            "pending"
+          ) {
+
+            return json(
+              {
+                error:
+                  "A conversation request is already pending."
+              },
+              409
+            );
+
+          }
+
+
+          /*
+            Allow a rejected conversation
+            to be requested again.
+          */
+
+          await env.DB.prepare(`
+            UPDATE conversations
+            SET
+              requested_by = ?,
+              status = 'pending',
+              updated_at = ?
+            WHERE id = ?
+          `)
+            .bind(
+              session.user_id,
+              Date.now(),
+              existing.id
+            )
+            .run();
+
+
+          return json({
+            ok: true,
+            message:
+              "Conversation request sent again."
+          });
+
+        }
+
+
+        await env.DB.prepare(`
+          INSERT INTO conversations
+          (
+            user_a,
+            user_b,
+            requested_by,
+            status,
+            created_at,
+            updated_at
+          )
+          VALUES (?, ?, ?, 'pending', ?, ?)
+        `)
+          .bind(
+            userA,
+            userB,
+            session.user_id,
+            Date.now(),
+            Date.now()
+          )
+          .run();
+
+
+        return json({
+          ok: true,
+          message:
+            "Conversation request sent."
+        });
+
+      }
+
+
+      /*
+      ==================================================
+      INCOMING REQUESTS
+      ==================================================
+      */
+
+      if (
+        request.method === "GET" &&
+        path === "/api/conversations/requests"
+      ) {
+
+        const session =
+          await requireUser(
+            request,
+            env
+          );
+
+
+        if (!session) {
+
+          return json(
+            {
+              error:
+                "Unauthorized"
+            },
+            401
+          );
+
+        }
+
+
+        const rows =
+          await env.DB.prepare(`
+            SELECT
+              c.id,
+              c.created_at,
+              u.username,
+              u.public_id
+            FROM conversations c
+            JOIN users u
+              ON u.id = c.requested_by
+            WHERE
+              c.status = 'pending'
+              AND c.requested_by != ?
+              AND
+              (
+                c.user_a = ?
+                OR
+                c.user_b = ?
+              )
+            ORDER BY c.created_at DESC
+          `)
+            .bind(
+              session.user_id,
+              session.user_id,
+              session.user_id
+            )
+            .all();
+
+
+        return json({
+          requests:
+            rows.results ||
+            []
+        });
+
+      }
+
+
+      /*
+      ==================================================
+      ACCEPT / REJECT REQUEST
+      ==================================================
+      */
+
+      if (
+        request.method === "POST" &&
+        path === "/api/conversations/respond"
+      ) {
+
+        const session =
+          await requireUser(
+            request,
+            env
+          );
+
+
+        if (!session) {
+
+          return json(
+            {
+              error:
+                "Unauthorized"
+            },
+            401
+          );
+
+        }
+
+
+        const {
+          conversation_id,
+          status
+        } =
+          await request.json();
+
+
+        const conversationId =
+          Number(
+            conversation_id
+          );
+
+
+        if (
+          !Number.isInteger(
+            conversationId
+          )
+        ) {
+
+          return json(
+            {
+              error:
+                "Invalid conversation ID."
+            },
+            400
+          );
+
+        }
+
+
+        if (
+          status !== "accepted" &&
+          status !== "rejected"
+        ) {
+
+          return json(
+            {
+              error:
+                "Invalid response."
+            },
+            400
+          );
+
+        }
+
+
+        const conversation =
+          await getConversationForUser(
+            env.DB,
+            conversationId,
+            session.user_id
+          );
+
+
+        if (!conversation) {
+
+          return json(
+            {
+              error:
+                "Conversation not found."
+            },
+            404
+          );
+
+        }
+
+
+        if (
+          conversation.status !==
+          "pending"
+        ) {
+
+          return json(
+            {
+              error:
+                "This request has already been handled."
+            },
+            409
+          );
+
+        }
+
+
+        /*
+          Only the recipient may accept/reject.
+        */
+
+        if (
+          conversation.requested_by ===
+          session.user_id
+        ) {
+
+          return json(
+            {
+              error:
+                "You cannot accept your own request."
+            },
+            403
+          );
+
+        }
+
+
+        await env.DB.prepare(`
+          UPDATE conversations
+          SET
+            status = ?,
+            updated_at = ?
+          WHERE id = ?
+        `)
+          .bind(
+            status,
+            Date.now(),
+            conversationId
+          )
+          .run();
+
+
+        return json({
+          ok: true,
+          status
+        });
+
+      }
+
+
+      /*
+      ==================================================
+      LIST ACCEPTED CONVERSATIONS
+      ==================================================
+      */
+
+      if (
+        request.method === "GET" &&
+        path === "/api/conversations"
+      ) {
+
+        const session =
+          await requireUser(
+            request,
+            env
+          );
+
+
+        if (!session) {
+
+          return json(
+            {
+              error:
+                "Unauthorized"
+            },
+            401
+          );
+
+        }
+
+
+        const rows =
+          await env.DB.prepare(`
+            SELECT
+              c.id,
+              c.status,
+              c.updated_at,
+
+              u.username,
+              u.public_id
+
+            FROM conversations c
+
+            JOIN users u
+              ON u.id =
+                CASE
+                  WHEN c.user_a = ?
+                  THEN c.user_b
+                  ELSE c.user_a
+                END
+
+            WHERE
+              c.status = 'accepted'
+              AND
+              (
+                c.user_a = ?
+                OR
+                c.user_b = ?
+              )
+
+            ORDER BY
+              c.updated_at DESC
+          `)
+            .bind(
+              session.user_id,
+              session.user_id,
+              session.user_id
+            )
+            .all();
+
+
+        return json({
+          conversations:
+            rows.results ||
+            []
+        });
+
+      }
+
+
+      /*
+      ==================================================
+      OPEN CONVERSATION
+      ==================================================
+      */
+
+      const conversationMatch =
+        path.match(
+          /^\\/api\\/conversations\\/(\\d+)$/
+        );
+
+
+      if (
+        request.method === "GET" &&
+        conversationMatch
+      ) {
+
+        const session =
+          await requireUser(
+            request,
+            env
+          );
+
+
+        if (!session) {
+
+          return json(
+            {
+              error:
+                "Unauthorized"
+            },
+            401
+          );
+
+        }
+
+
+        const conversationId =
+          Number(
+            conversationMatch[1]
+          );
+
+
+        const conversation =
+          await getConversationForUser(
+            env.DB,
+            conversationId,
+            session.user_id
+          );
+
+
+        if (!conversation) {
+
+          return json(
+            {
+              error:
+                "Conversation not found."
+            },
+            404
+          );
+
+        }
+
+
+        if (
+          conversation.status !==
+          "accepted"
+        ) {
+
+          return json(
+            {
+              error:
+                "Conversation is not active."
+            },
+            403
+          );
+
+        }
+
+
+        const otherUserId =
+          conversation.user_a ===
+          session.user_id
+            ? conversation.user_b
+            : conversation.user_a;
+
+
+        const otherUser =
+          await env.DB.prepare(`
+            SELECT
+              username,
+              public_id
+            FROM users
+            WHERE id = ?
+          `)
+            .bind(
+              otherUserId
+            )
+            .first();
+
+
+        const messages =
+          await env.DB.prepare(`
+            SELECT
+              id,
+              sender_id,
+              body,
+              created_at
+            FROM conversation_messages
+            WHERE conversation_id = ?
+            ORDER BY id ASC
+          `)
+            .bind(
+              conversationId
+            )
+            .all();
+
+
+        return json({
+          conversation: {
+            id:
+              conversation.id,
+
+            status:
+              conversation.status
+          },
+
+          user: {
+            username:
+              otherUser?.username,
+
+            public_id:
+              otherUser?.public_id
+          },
+
+          messages:
+            (
+              messages.results ||
+              []
+            ).map(
+              message => ({
+                id:
+                  message.id,
+
+                body:
+                  message.body,
+
+                created_at:
+                  message.created_at,
+
+                mine:
+                  message.sender_id ===
+                  session.user_id
+              })
+            )
+        });
+
+      }
+
+
+      /*
+      ==================================================
+      SEND PRIVATE MESSAGE
+      ==================================================
+      */
+
+      if (
+        request.method === "POST" &&
+        path === "/api/conversations/message"
+      ) {
+
+        const session =
+          await requireUser(
+            request,
+            env
+          );
+
+
+        if (!session) {
+
+          return json(
+            {
+              error:
+                "Unauthorized"
+            },
+            401
+          );
+
+        }
+
+
+        const {
+          conversation_id,
+          body
+        } =
+          await request.json();
+
+
+        const conversationId =
+          Number(
+            conversation_id
+          );
+
+
+        if (
+          !Number.isInteger(
+            conversationId
+          )
+        ) {
+
+          return json(
+            {
+              error:
+                "Invalid conversation ID."
+            },
+            400
+          );
+
+        }
+
+
+        if (
+          typeof body !==
+            "string" ||
+          !body.trim() ||
+          body.length >
+            MAX_MESSAGE
+        ) {
+
+          return json(
+            {
+              error:
+                "Invalid message."
+            },
+            400
+          );
+
+        }
+
+
+        const conversation =
+          await getConversationForUser(
+            env.DB,
+            conversationId,
+            session.user_id
+          );
+
+
+        if (!conversation) {
+
+          return json(
+            {
+              error:
+                "Conversation not found."
+            },
+            404
+          );
+
+        }
+
+
+        if (
+          conversation.status !==
+          "accepted"
+        ) {
+
+          return json(
+            {
+              error:
+                "Conversation is not active."
+            },
+            403
+          );
+
+        }
+
+
+        const now =
+          Date.now();
+
+
+        await env.DB.batch([
+
+          env.DB.prepare(`
+            INSERT INTO conversation_messages
+            (
+              conversation_id,
+              sender_id,
+              body,
+              created_at
+            )
+            VALUES (?, ?, ?, ?)
+          `)
+            .bind(
+              conversationId,
+              session.user_id,
+              body.trim(),
+              now
+            ),
+
+          env.DB.prepare(`
+            UPDATE conversations
+            SET updated_at = ?
+            WHERE id = ?
+          `)
+            .bind(
+              now,
+              conversationId
+            )
+
+        ]);
+
+
+        return json({
+          ok: true
+        });
+
+      }
+
+
+      /*
+      ==================================================
+      ADMIN USERS
+      ==================================================
+      */
+
+      if (
+        request.method === "GET" &&
+        path === "/api/admin/users"
+      ) {
+
+        const session =
+          await requireAdmin(
+            request,
+            env
+          );
+
+
+        if (!session) {
+
+          return json(
+            {
+              error:
+                "Unauthorized"
+            },
+            401
+          );
+
+        }
+
+
+        const rows =
+          await env.DB.prepare(`
+            SELECT
+              id,
+              username,
+              public_id,
+              created_at
+            FROM users
+            WHERE role = 'user'
+            ORDER BY username ASC
+          `)
+            .all();
+
+
+        return json({
+          users:
+            rows.results ||
+            []
+        });
+
+      }
+
+
+      /*
+      ==================================================
+      ADMIN READ MESSAGES
+      ==================================================
+      */
+
+      if (
+        request.method === "GET" &&
+        path === "/api/admin/messages"
+      ) {
+
+        const session =
+          await requireAdmin(
+            request,
+            env
+          );
+
+
+        if (!session) {
+
+          return json(
+            {
+              error:
+                "Unauthorized"
+            },
+            401
+          );
+
+        }
+
+
+        const userId =
+          Number(
+            url.searchParams.get(
+              "user_id"
+            )
+          );
+
+
+        if (
+          !Number.isInteger(
+            userId
+          ) ||
+          userId <= 0
+        ) {
+
+          return json(
+            {
+              error:
+                "Valid user_id is required."
+            },
+            400
+          );
+
+        }
+
+
+        const rows =
+          await env.DB.prepare(`
+            SELECT
+              id,
+              sender_role,
+              body,
+              created_at
+            FROM messages
+            WHERE user_id = ?
+            ORDER BY id ASC
+          `)
+            .bind(
+              userId
+            )
+            .all();
+
+
+        return json({
+          messages:
+            rows.results ||
+            []
+        });
+
+      }
+
+
+      /*
+      ==================================================
+      ADMIN SEND MESSAGE
+      ==================================================
+      */
+
+      if (
+        request.method === "POST" &&
+        path === "/api/admin/messages"
+      ) {
+
+        const session =
+          await requireAdmin(
+            request,
+            env
+          );
+
+
+        if (!session) {
+
+          return json(
+            {
+              error:
+                "Unauthorized"
+            },
+            401
+          );
+
+        }
+
+
+        const {
+          user_id,
+          body
+        } =
+          await request.json();
+
+
+        const userId =
+          Number(
+            user_id
+          );
+
+
+        if (
+          !Number.isInteger(
+            userId
+          ) ||
+          userId <= 0
+        ) {
+
+          return json(
+            {
+              error:
+                "Invalid user_id."
+            },
+            400
+          );
+
+        }
+
+
+        if (
+          typeof body !==
+            "string" ||
+          !body.trim() ||
+          body.length >
+            MAX_MESSAGE
+        ) {
+
+          return json(
+            {
+              error:
+                "Invalid message."
+            },
+            400
+          );
+
+        }
+
+
+        const user =
+          await env.DB.prepare(`
+            SELECT id
+            FROM users
+            WHERE id = ?
+              AND role = 'user'
+          `)
+            .bind(
+              userId
+            )
+            .first();
+
+
+        if (!user) {
+
+          return json(
+            {
+              error:
+                "User not found."
+            },
+            404
+          );
+
+        }
+
+
+        await env.DB.prepare(`
+          INSERT INTO messages
+          (
+            user_id,
+            sender_role,
+            body,
+            created_at
+          )
+          VALUES (?, ?, ?, ?)
+        `)
+          .bind(
+            userId,
+            "admin",
+            body.trim(),
+            Date.now()
+          )
+          .run();
+
+
+        return json({
+          ok: true
+        });
+
+      }
+
+
+      /*
+      ==============================================
+      NOT FOUND
+      ==============================================
+      */
+
+      return new Response(
+        "Not Found",
+        {
+          status: 404
+        }
+      );
+
+
+    } catch (error) {
+
+      console.error(
+        error
+      );
+
+
+      return json(
+        {
+          error:
+            error?.message ||
+            "Internal server error."
+        },
+        500
+      );
+
+    }
+
+  }
+
+};
