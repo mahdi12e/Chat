@@ -1367,7 +1367,6 @@ async function loadDirectMessages() {
     return;
   }
 
-
   const data =
     await api(
       "/api/direct/messages?user_id=" +
@@ -1376,13 +1375,11 @@ async function loadDirectMessages() {
       )
     );
 
-
   const container =
     document
       .getElementById(
         "directMessages"
       );
-
 
   container.innerHTML =
     data.messages
@@ -1397,52 +1394,52 @@ async function loadDirectMessages() {
               currentUserId
             );
 
+          const senderName =
+            mine
+              ? "You"
+              : escapeHTML(
+                  selectedUsername
+                );
 
-          return `
-            <div class="message ${
-              mine
-                ? "mine"
-                : "theirs"
-            }">
+          const messageBody =
+            escapeHTML(
+              message.body
+            );
 
-              <div>
-                <strong>
-                  ${
-                    mine
-                      ? "You"
-                      : escapeHTML(
-                          selectedUsername
-                        )
-                  }
-                </strong>
-              </div>
+          const timestamp =
+            new Date(
+              message.created_at
+            ).toLocaleString();
 
-              <div>
-                ${
-                  escapeHTML(
-                    message.body
-                  )
-                }
-              </div>
+          return (
+            '<div class="message ' +
+            (mine
+              ? 'mine'
+              : 'theirs') +
+            '">' +
 
-              <div class="timestamp">
-                ${
-                  new Date(
-                    message.created_at
-                  ).toLocaleString()
-                }
-              </div>
+              '<div>' +
+                '<strong>' +
+                  senderName +
+                '</strong>' +
+              '</div>' +
 
-            </div>
-          `;
+              '<div>' +
+                messageBody +
+              '</div>' +
+
+              '<div class="timestamp">' +
+                timestamp +
+              '</div>' +
+
+            '</div>'
+          );
 
         }
       )
       .join("");
 
 }
-
-
 /* =========================================================
    SEND DIRECT MESSAGE
 ========================================================= */
@@ -1549,16 +1546,18 @@ async function loadUsers() {
             );
 
 
-          return `
-            <button
-              class="user-button"
-              onclick="selectUser(${user.id})"
-            >
-              ${safeName}
-              — ID: ${user.id}
-            </button>
-          `;
-
+          return (
+  '<button ' +
+    'class="user-button" ' +
+    'onclick="selectUser(' +
+      user.id +
+    ')"' +
+  '>' +
+    safeName +
+    ' — ID: ' +
+    user.id +
+  '</button>'
+);
         }
       )
       .join("");
@@ -1656,29 +1655,27 @@ async function loadAdminMessages() {
       .map(
         message => {
 
-          return `
-            <div class="message ${
-              message.sender_role
-            }">
+          return (
+  '<div class="message ' +
+    escapeHTML(
+      message.sender_role
+    ) +
+  '">' +
 
-              <div>
-                ${
-                  escapeHTML(
-                    message.body
-                  )
-                }
-              </div>
+    '<div>' +
+      escapeHTML(
+        message.body
+      ) +
+    '</div>' +
 
-              <div class="timestamp">
-                ${
-                  new Date(
-                    message.created_at
-                  ).toLocaleString()
-                }
-              </div>
+    '<div class="timestamp">' +
+      new Date(
+        message.created_at
+      ).toLocaleString() +
+    '</div>' +
 
-            </div>
-          `;
+  '</div>'
+);
 
         }
       )
