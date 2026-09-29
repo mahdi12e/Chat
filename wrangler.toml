@@ -6,9 +6,8 @@ workers_dev = true
 # D1 database binding. The Worker code uses env.DB.
 [[d1_databases]]
 binding = "DB"
-database_name = "private-chat-db"
-database_id = "REPLACE_WITH_YOUR_D1_DATABASE_ID"
-
+database_name = "m2jaf"
+database_id = "2cb67b51-caf0-4f22-9a80-df56e87aa5ec"
 # ADMIN_PASSWORD is a secret and is NOT stored in this file.
 # CLI:        npx wrangler secret put ADMIN_PASSWORD
 # Dashboard:  Worker > Settings > Variables and Secrets > Add (type: Secret)
